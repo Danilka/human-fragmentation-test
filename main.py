@@ -1,4 +1,3 @@
-# from pathos.pools import ParallelPool
 from multiprocessing import Pool
 import math
 import numpy as np
@@ -8,16 +7,11 @@ from defaultlist import defaultlist
 from scipy.stats import truncnorm
 
 
-
-def dumb(i):
-    print(len(i))
-
-
 class Simulator:
 
-    PROCESSES = 2
+    PROCESSES = 6
 
-    CLUSTERS = 32  # *256
+    CLUSTERS = 64  # *256
     NODES_PER_CLUSTER = 16
     NODES = CLUSTERS * NODES_PER_CLUSTER
     BUSINESSES_PERCENT = 0.05  # float % from 0 to 1
@@ -54,7 +48,7 @@ class Simulator:
         self.bills = {}
 
         # {owner_id} -> [bill_id, bill_id, ...]
-        self.wallets = defaultlist()
+        self.wallets = {} #defaultlist()
 
         # Set of all nodes that are businesses.
         # (business_id, business_id, business_id, ...)
@@ -72,35 +66,25 @@ class Simulator:
         # {node_id} -> [person_id (node), person_id, person_id, ...]
         self.p_receivers = {}
 
-    def run(self):
-
         with Timer('Generate nodes'):
             self.generate_nodes()
 
         with Timer('Generate payees'):
+            # Non parallel version
+            # payees = []
             # for i in range(NODES):
             #     payees.append(generate_node_payees(i))
 
-            self.payees = []
-
-            nodes_buckets = np.array_split(range(self.NODES), self.PROCESSES)
-            # with ParallelPool(self.PROCESSES) as pool:
-            #     self.payees = pool.map(self.generate_node_payees_bulk, nodes_buckets)
-
+            # nodes_buckets = np.array_split(range(self.NODES), self.PROCESSES)
             with Pool(self.PROCESSES) as pool:
-                # self.payees = pool.map(self.generate_node_payees_bulk, nodes_buckets)
-                self.payees = pool.map(dumb, nodes_buckets)
+                payees = pool.map(self.generate_node_payees, range(self.NODES))
 
-            # for node_bucket in nodes_buckets:
-            #     # print("Bucket length {}".format(len(node_bucket)))
-            #     self.payees.append(self.generate_node_payees_bulk(node_bucket))
-            # print(self.generate_node_payees_bulk(node_bucket))
+            for i in range(self.NODES):
+                self.b_receivers[i] = payees[i][0]
+                self.p_receivers[i] = payees[i][1]
 
-            print(len(self.payees))
+            print('done')
 
-        # for i in range(NODES):
-        #     b_receivers[i] = payees[i][0]
-        #     p_receivers[i] = payees[i][1]
 
     def close_dist(self, distance):
         """Returns True if the distance is close."""
@@ -226,6 +210,5 @@ class Simulator:
         return res
 
 
-# if __name__ == '__main__':
-simulator = Simulator()
-simulator.run()
+if __name__ == '__main__':
+    simulator = Simulator()
