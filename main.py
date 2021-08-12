@@ -3,8 +3,8 @@ import math
 import numpy as np
 import random
 from timer_cm import Timer
-from defaultlist import defaultlist
 from scipy.stats import truncnorm
+from statistics import mean
 
 
 class Simulator:
@@ -15,8 +15,6 @@ class Simulator:
     NODES_PER_CLUSTER = 16
     NODES = CLUSTERS * NODES_PER_CLUSTER
     BUSINESSES_PERCENT = 0.05  # float % from 0 to 1
-
-    BILLS = NODES
 
     TRANSACTIONS_P2P_PERCENT = 0.2  # float % from 0 to 1
     TRANSACTIONS_P2B_PERCENT = 0.8  # float % from 0 to 1
@@ -31,6 +29,11 @@ class Simulator:
     NET_WORTH_AVG = 1000 * 100  # In cents
     NET_WORTH_MIN = 15 * 100  # In cents
     NET_WORTH_MAX = 1000 * 1000 * 100  # In cents
+
+    # Bills per person
+    BILLS_PP_AVG = 10
+    BILLS_PP_MIN = 2
+    BILLS_PP_MAX = 1000
 
     # X and Y field coordinate boundaries.
     MAX_X = 1000
@@ -48,7 +51,7 @@ class Simulator:
         self.bills = {}
 
         # {owner_id} -> [bill_id, bill_id, ...]
-        self.wallets = {} #defaultlist()
+        self.wallets = {}
 
         # Set of all nodes that are businesses.
         # (business_id, business_id, business_id, ...)
@@ -83,8 +86,27 @@ class Simulator:
                 self.b_receivers[i] = payees[i][0]
                 self.p_receivers[i] = payees[i][1]
 
-            print('done')
+        with Timer('Generate bills'):
+            # TODO Parallelize this.
+            self.generate_bills()
 
+        self.system_status()
+
+    def system_status(self):
+        print("{} nodes.".format(len(self.nodes_loc)))
+        print("Mean friends per person: {}".format(mean([len(self.p_receivers[i]) for i in range(self.NODES)])))
+        print("Mean businesses per person: {}".format(mean([len(self.b_receivers[i]) for i in range(self.NODES)])))
+
+        totals = [self.bills[x]['size'] for x in self.bills.keys()]
+        print("{}$ in the system.".format(sum(totals)/100))
+        print("Mean bill size ${}".format(mean(totals)/100))
+        print("Total bills: {}".format(len(self.bills.keys())))
+        print("Avg bills per person: {}".format(len(self.bills.keys())/self.NODES))
+
+        wealth = [sum([self.bills[x]['size'] for x in self.wallets[i]]) for i in range(self.NODES)]
+        print("Mean wealth per person ${}".format(mean(wealth)/100))
+        print("Max wealth: ${}".format(max(wealth)/100))
+        print("Min wealth: ${}".format(min(wealth)/100))
 
     def close_dist(self, distance):
         """Returns True if the distance is close."""
@@ -94,17 +116,18 @@ class Simulator:
         """Returns True if the distance is far."""
         return not self.close_dist(distance)
 
-    def get_asymmetric_norm(self, low, mean, upp):
+    def get_asymmetric_norm(self, low, mid, upp):
         """Get one random number from an unbalanced normal distribution."""
-        sd = 1
-        if random.getrandbits(1):
+        # if random.uniform(0, 1) < 0.5:
+        if random.uniform(low, upp) < mid:
             # Less than a mean
-            upp = mean
+            upp = mid
         else:
             # Greater than a mean
-            low = mean
+            low = mid
 
-        distribution = truncnorm((low - mean) / sd, (upp - mean) / sd, loc=mean, scale=sd)
+        sd = (upp - low) / 3
+        distribution = truncnorm((low - mid) / sd, (upp - mid) / sd, loc=mid, scale=sd)
         return distribution.rvs().round().astype(int)
 
     def node_to_cluster(self, node_id: int) -> int:
@@ -209,6 +232,92 @@ class Simulator:
             res.append(self.generate_node_payees(i))
         return res
 
+    def generate_node_bills(self, bill_ids, total, node_id):
+        bills_part = {}
+
+        # Split total into specific bills.
+        node_bills = self.split_int(total, len(bill_ids))
+        for i in range(len(bill_ids)):
+            bill_size = node_bills[i]
+            bill_id = bill_ids[i]
+            # Create a bill.
+            bills_part[bill_id] = {
+                'size': bill_size,
+                'owner': node_id,
+                'cluster': random.randrange(self.CLUSTERS)
+            }
+
+        return bills_part
+
+    def generate_bills(self):
+
+        with Pool(self.PROCESSES) as pool:
+            totals = pool.starmap(self.get_asymmetric_norm, [(self.NET_WORTH_MIN, self.NET_WORTH_AVG, self.NET_WORTH_MAX) for _ in range(self.NODES)])
+            n_bills = pool.starmap(self.get_asymmetric_norm, [(self.BILLS_PP_MIN, self.BILLS_PP_AVG, self.BILLS_PP_MAX) for _ in range(self.NODES)])
+
+        total_bills = 0
+        bill_ids = []
+        for i in range(self.NODES):
+            # In case we have more bills than cents.
+            if n_bills[i] > totals[i]:
+                n_bills[i] = totals[i]
+
+            # Generate bill IDs buckets.
+            node_bill_ids = []
+            for j in range(n_bills[i]):
+                total_bills += 1
+                node_bill_ids.append(total_bills-1)
+            bill_ids.append(node_bill_ids)
+
+        # Generate bills in parallel.
+        with Pool(self.PROCESSES) as pool:
+            nodes_bills = pool.starmap(self.generate_node_bills, [(bill_ids[x], totals[x], x) for x in range(self.NODES)])
+
+        # Save generated results into global vars.
+        for i in range(self.NODES):
+            self.wallets[i] = list(nodes_bills[i].keys())
+            self.bills.update(nodes_bills[i])
+
+        # bill_id = -1
+        # for i in range(self.NODES):
+        #     # Make a blank wallet for this node.
+        #     self.wallets[i] = []
+        #
+        #     # In cents
+        #     total = self.get_asymmetric_norm(self.NET_WORTH_MIN, self.NET_WORTH_AVG, self.NET_WORTH_MAX)
+        #     n_bills = self.get_asymmetric_norm(self.BILLS_PP_MIN, self.BILLS_PP_AVG, self.BILLS_PP_MAX)
+        #
+        #     # In case we have more bills than cents.
+        #     if n_bills > total:
+        #         total = n_bills
+        #
+        #     # Split total into specific bills.
+        #     node_bills = self.split_int(total, n_bills)
+        #     for bill_size in node_bills:
+        #         # Create a bill.
+        #         bill_id += 1
+        #         self.bills[bill_id] = {
+        #             'size': bill_size,
+        #             'owner': i,
+        #             'cluster': random.randrange(self.CLUSTERS)
+        #         }
+        #         # Save the bill into a wallet.
+        #         self.wallets[i].append(bill_id)
+
+    def split_int(self, num, n_pieces) -> list:
+        """Splits integer num into # of random n_pieces."""
+        assert num >= n_pieces >= 1
+
+        pieces = []
+        for i in range(n_pieces - 1):
+            pieces.append(random.randint(1, num - (n_pieces - i) + 1))
+            num -= pieces[-1]
+        pieces.append(num)
+
+        return pieces
 
 if __name__ == '__main__':
     simulator = Simulator()
+
+
+
