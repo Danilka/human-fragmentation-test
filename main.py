@@ -1,4 +1,4 @@
-from multiprocessing import Pool
+from multiprocessing import Pool, Value
 import math
 import numpy as np
 import random
@@ -50,6 +50,8 @@ class Simulator:
         # {bill_id} -> {size: 123, owner: node_id, cluster: cluster_id}
         self.bills = {}
 
+        self.next_bill_id = Value('i', 0)
+
         # {owner_id} -> [bill_id, bill_id, ...]
         self.wallets = {}
 
@@ -87,7 +89,6 @@ class Simulator:
                 self.p_receivers[i] = payees[i][1]
 
         with Timer('Generate bills'):
-            # TODO Parallelize this.
             self.generate_bills()
 
         self.system_status()
@@ -269,6 +270,9 @@ class Simulator:
                 node_bill_ids.append(total_bills-1)
             bill_ids.append(node_bill_ids)
 
+        # Set global counter to the next bill ID (last ID + 1).
+        self.next_bill_id.value = bill_ids[-1][-1] + 1
+
         # Generate bills in parallel.
         with Pool(self.PROCESSES) as pool:
             nodes_bills = pool.starmap(self.generate_node_bills, [(bill_ids[x], totals[x], x) for x in range(self.NODES)])
@@ -278,33 +282,8 @@ class Simulator:
             self.wallets[i] = list(nodes_bills[i].keys())
             self.bills.update(nodes_bills[i])
 
-        # bill_id = -1
-        # for i in range(self.NODES):
-        #     # Make a blank wallet for this node.
-        #     self.wallets[i] = []
-        #
-        #     # In cents
-        #     total = self.get_asymmetric_norm(self.NET_WORTH_MIN, self.NET_WORTH_AVG, self.NET_WORTH_MAX)
-        #     n_bills = self.get_asymmetric_norm(self.BILLS_PP_MIN, self.BILLS_PP_AVG, self.BILLS_PP_MAX)
-        #
-        #     # In case we have more bills than cents.
-        #     if n_bills > total:
-        #         total = n_bills
-        #
-        #     # Split total into specific bills.
-        #     node_bills = self.split_int(total, n_bills)
-        #     for bill_size in node_bills:
-        #         # Create a bill.
-        #         bill_id += 1
-        #         self.bills[bill_id] = {
-        #             'size': bill_size,
-        #             'owner': i,
-        #             'cluster': random.randrange(self.CLUSTERS)
-        #         }
-        #         # Save the bill into a wallet.
-        #         self.wallets[i].append(bill_id)
-
-    def split_int(self, num, n_pieces) -> list:
+    @staticmethod
+    def split_int(num, n_pieces) -> list:
         """Splits integer num into # of random n_pieces."""
         assert num >= n_pieces >= 1
 
@@ -315,6 +294,84 @@ class Simulator:
         pieces.append(num)
 
         return pieces
+
+    @staticmethod
+    def bit_distance(id1, id2):
+        """Get mathematical distance between 2 integers."""
+        return bin(id1 ^ id2).count("1")
+
+    def send_amount(self, from_node_id, to_node_id):
+        to_cluster_id = to_node_id % self.NODES_PER_CLUSTER
+        # TODO Finish this.
+
+    def get_next_bill_id(self):
+        """Returns the next bill ID. Thread safe."""
+        next_id = self.next_bill_id
+        self.next_bill_id.value += 1
+        return next_id
+
+    def combine_nodes_bills(self, node_id):
+        """Combines all node's bills that can be combined."""
+
+        # Sort all node's bills by cluster_id.
+        self.wallets[node_id] = sorted(self.wallets[node_id], key=lambda x: self.bills[x]['cluster'])
+
+        # Iterate over all bills and see if any could be combined.
+        i = 1
+        while i < len(self.wallets[node_id]):
+            bill1_id = self.wallets[node_id][i-1]
+            bill2_id = self.wallets[node_id][i]
+
+            if self.bills[bill1_id]['cluster'] == self.bills[bill2_id]['cluster']:
+                # This will combine the bills and remove second id from the wallet, so no need to iterate i.
+                self.combine_two_bills(bill1_id, bill2_id)
+            else:
+                i += 1
+
+    def combine_two_bills(self, bill1_id, bill2_id):
+        """Combines two bills into the first one. Can only be done for the same owner on the same cluster."""
+
+        assert self.bills[bill1_id]['owner'] == self.bills[bill2_id]['owner']
+        assert self.bills[bill1_id]['cluster'] == self.bills[bill2_id]['cluster']
+
+        # Add the value from 2 to 1 bill.
+        self.bills[bill1_id]['size'] += self.bills[bill2_id]['size']
+
+        # Delete bill 2 from user's wallet.
+        self.wallets[self.bills[bill2_id]['owner']].remove(bill2_id)
+
+        # Delete bill2
+        del self.bills[bill2_id]
+
+    def split_bill(self, bill, amount_needed):
+        """
+        Splits a bill into two. One of the amount needed. Thread safe.
+        You need to do the following with the returned values:
+        1. Replace the old bill.
+        2. Add new bill to self.bills
+        3. Add the new bill to owner's wallet.
+        :param bill: Old bill object.
+        :param amount_needed: Float of the amount of the new bill (less than the old bill).
+        :return: (new bill id, new bill object, updated old bill)
+        """
+
+        assert amount_needed < bill['size']
+
+        # Lower the size of previous bill.
+        bill['size'] -= amount_needed
+
+        # Create a new bill.
+        # {size: 123, owner: node_id, cluster: cluster_id}
+        new_bill = {
+            'size': amount_needed,
+            'owner': bill['owner'],
+            'cluster_id': bill['cluster'],
+        }
+        return (
+            self.get_next_bill_id(),
+            new_bill,
+            bill,
+        )
 
 if __name__ == '__main__':
     simulator = Simulator()
