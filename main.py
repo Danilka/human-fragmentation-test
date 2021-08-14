@@ -58,10 +58,12 @@ class Simulator:
         # Set of all nodes that are businesses.
         # (business_id, business_id, business_id, ...)
         self.businesses = set()
+        self.randomized_businesses = list()
 
         # Set of all nodes that are not businesses.
         # (private_node_id, private_node_id, private_node_id, ...)
         self.non_businesses = set()
+        self.randomized_non_businesses = list()
 
         # Business receivers for each node to address.
         # {node_id} -> [business_id (node), business_id, business_id, ...]
@@ -133,7 +135,7 @@ class Simulator:
 
     def node_to_cluster(self, node_id: int) -> int:
         """Get cluster_id that node_id belongs to."""
-        return node_id % self.NODES_PER_CLUSTER
+        return node_id // self.NODES_PER_CLUSTER
 
     def distance_between_nodes(self, node_id_from: int, node_id_to: int) -> float:
         """Get distance between two node IDs."""
@@ -161,7 +163,6 @@ class Simulator:
         # Set defaults for randomized businesses and non businesses.
         self.randomized_businesses = list(self.businesses)
         self.randomized_non_businesses = list(self.non_businesses)
-
 
     def generate_node_payees(self, node_id):
         """
@@ -300,9 +301,68 @@ class Simulator:
         """Get mathematical distance between 2 integers."""
         return bin(id1 ^ id2).count("1")
 
-    def send_amount(self, from_node_id, to_node_id):
-        to_cluster_id = to_node_id % self.NODES_PER_CLUSTER
-        # TODO Finish this.
+    def send_amount(self, from_node_id: int, to_node_id: int, amount: float, check_balance: bool = True) -> bool:
+        """
+        Send an amount from one node to another.
+        :param from_node_id:
+        :param to_node_id:
+        :param amount:
+        :param check_balance: True - checks balance before sending anything. False - starts sending regardless.
+        :return: True - Amount sent. False - balance is too low.
+        """
+        # Check if the node has enough money for the transaction.
+        if check_balance:
+            if self.get_balance(from_node_id) < amount:
+                return False
+
+        to_cluster_id = self.node_to_cluster(to_node_id)
+        from_cluster_id = self.node_to_cluster(from_node_id)
+        self.wallets[from_node_id] = sorted(
+            self.wallets[from_node_id],
+            key=lambda x: (
+                # Sort by distance to the receiver's cluster first, excluding bills in sender's cluster.
+                float("inf") if self.bills[x]['cluster'] == from_cluster_id else Simulator.bit_distance(
+                    self.bills[x]['cluster'],
+                    to_cluster_id,
+                ),
+                self.bills[x]['size'],  # Sort by the smallest bill size second.
+            ),
+            reverse=True,   # So we can pop the bills from the end.
+        )
+
+        amount_left_to_send = amount
+        # Sending until we ren out of the needed amount or bills.
+        while amount_left_to_send and len(self.wallets[from_node_id]):
+            # Take the bill that we are operating with.
+            bill_id = self.wallets[from_node_id].pop()
+
+            # If the bill is not enough to cover the transaction, we send the whole bill.
+            if self.bills[bill_id]['size'] < amount_left_to_send:
+                amount_left_to_send -= self.bills[bill_id]['size']
+
+                # Send the whole bill.
+                self.bills[bill_id]['owner'] = to_node_id
+                self.wallets[to_node_id].append(bill_id)
+            # If the bill is more than we need, we split it and send a part.
+            else:
+                amount_left_to_send = 0.0
+                new_bill_id, new_bill, bill = self.split_bill(self.bills[bill_id], amount_left_to_send)
+
+                # Return chopped bill back to the owner.
+                self.bills[bill_id] = bill
+                self.wallets[from_node_id].append(bill_id)
+
+                # Send the new bill.
+                new_bill['owner'] = to_node_id
+                self.bills[new_bill_id] = new_bill
+                self.wallets[to_node_id].append(new_bill_id)
+
+    def get_balance(self, node_id: int) -> float:
+        """Get balance of specified node."""
+        total = 0.0
+        for bill_id in self.wallets[node_id]:
+            total += self.bills[bill_id]['size']
+        return total
 
     def get_next_bill_id(self):
         """Returns the next bill ID. Thread safe."""
