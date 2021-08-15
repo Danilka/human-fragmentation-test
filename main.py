@@ -6,6 +6,8 @@ from timer_cm import Timer
 from scipy.stats import truncnorm
 from statistics import mean
 
+next_bill_id = Value('i', 0)
+
 
 class Simulator:
 
@@ -50,8 +52,6 @@ class Simulator:
         # {bill_id} -> {size: 123, owner: node_id, cluster: cluster_id}
         self.bills = {}
 
-        self.next_bill_id = Value('i', 0)
-
         # {owner_id} -> [bill_id, bill_id, ...]
         self.wallets = {}
 
@@ -90,10 +90,39 @@ class Simulator:
                 self.b_receivers[i] = payees[i][0]
                 self.p_receivers[i] = payees[i][1]
 
+
         with Timer('Generate bills'):
             self.generate_bills()
 
         self.system_status()
+
+    def run(self, transactions: int = 1000):
+        for i in range(transactions):
+            self.run_transaction()
+
+    def run_transaction(self):
+        """Run a random transaction."""
+        # Pick the nodes for the transaction.
+        from_node_id = random.randrange(self.NODES)
+        to_node_id = self.pick_recipient(from_node_id)
+
+        # Pick amount.
+        amount = self.get_balance(from_node_id) * random.uniform(0.01, 1.0) ** 2
+
+        # Perform the transaction.
+        self.send_amount(from_node_id, to_node_id,amount, check_balance=False)
+
+        # Merge bills for the receiver.
+        self.merge_nodes_bills(to_node_id)
+
+    def pick_recipient(self, node_id):
+        """Pick a recipient for a transaction from node_id."""
+        if random.uniform(0, 1) > 0.8:
+            # Transaction to a private person.
+            return random.choice(list(self.p_receivers[node_id]))
+        else:
+            # Transaction to a business.
+            return random.choice(list(self.b_receivers[node_id]))
 
     def system_status(self):
         print("{} nodes.".format(len(self.nodes_loc)))
@@ -252,6 +281,7 @@ class Simulator:
         return bills_part
 
     def generate_bills(self):
+        global next_bill_id
 
         with Pool(self.PROCESSES) as pool:
             totals = pool.starmap(self.get_asymmetric_norm, [(self.NET_WORTH_MIN, self.NET_WORTH_AVG, self.NET_WORTH_MAX) for _ in range(self.NODES)])
@@ -272,7 +302,7 @@ class Simulator:
             bill_ids.append(node_bill_ids)
 
         # Set global counter to the next bill ID (last ID + 1).
-        self.next_bill_id.value = bill_ids[-1][-1] + 1
+        next_bill_id.value = bill_ids[-1][-1] + 1
 
         # Generate bills in parallel.
         with Pool(self.PROCESSES) as pool:
@@ -366,11 +396,13 @@ class Simulator:
 
     def get_next_bill_id(self):
         """Returns the next bill ID. Thread safe."""
-        next_id = self.next_bill_id
-        self.next_bill_id.value += 1
+        global next_bill_id
+
+        next_id = next_bill_id.value
+        next_bill_id.value += 1
         return next_id
 
-    def combine_nodes_bills(self, node_id):
+    def merge_nodes_bills(self, node_id):
         """Combines all node's bills that can be combined."""
 
         # Sort all node's bills by cluster_id.
@@ -425,7 +457,7 @@ class Simulator:
         new_bill = {
             'size': amount_needed,
             'owner': bill['owner'],
-            'cluster_id': bill['cluster'],
+            'cluster': bill['cluster'],
         }
         return (
             self.get_next_bill_id(),
@@ -433,8 +465,9 @@ class Simulator:
             bill,
         )
 
+
 if __name__ == '__main__':
     simulator = Simulator()
-
-
+    simulator.run()
+    simulator.system_status()
 
