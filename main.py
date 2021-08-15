@@ -13,7 +13,7 @@ class Simulator:
 
     PROCESSES = 6
 
-    CLUSTERS = 64  # *256
+    CLUSTERS = 32  # *256
     NODES_PER_CLUSTER = 16
     NODES = CLUSTERS * NODES_PER_CLUSTER
     BUSINESSES_PERCENT = 0.05  # float % from 0 to 1
@@ -269,7 +269,7 @@ class Simulator:
         # Split total into specific bills.
         node_bills = self.split_int(total, len(bill_ids))
         for i in range(len(bill_ids)):
-            bill_size = node_bills[i]
+            bill_size = float(node_bills[i])
             bill_id = bill_ids[i]
             # Create a bill.
             bills_part[bill_id] = {
@@ -450,7 +450,7 @@ class Simulator:
         assert amount_needed < bill['size']
 
         # Lower the size of previous bill.
-        bill['size'] -= amount_needed
+        bill['size'] -= float(amount_needed)
 
         # Create a new bill.
         # {size: 123, owner: node_id, cluster: cluster_id}
