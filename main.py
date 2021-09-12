@@ -1,3 +1,4 @@
+import copy
 from multiprocessing import Pool, Value
 import math
 import numpy as np
@@ -5,15 +6,18 @@ import random
 from timer_cm import Timer
 from scipy.stats import truncnorm
 from statistics import mean
+import logging
 
+
+log = logging.getLogger(__name__)
 next_bill_id = Value('i', 0)
 
 
 class Simulator:
 
-    PROCESSES = 6
+    PROCESSES = 7
 
-    CLUSTERS = 32  # *256
+    CLUSTERS = 64  # *256
     NODES_PER_CLUSTER = 16
     NODES = CLUSTERS * NODES_PER_CLUSTER
     BUSINESSES_PERCENT = 0.05  # float % from 0 to 1
@@ -90,30 +94,139 @@ class Simulator:
                 self.b_receivers[i] = payees[i][0]
                 self.p_receivers[i] = payees[i][1]
 
-
         with Timer('Generate bills'):
             self.generate_bills()
 
         self.system_status()
 
     def run(self, transactions: int = 1000):
+        global log
+
         for i in range(transactions):
-            self.run_transaction()
+            with Timer("Transactions run #{}".format(i)):
+                self.transactions_run()
 
-    def run_transaction(self):
-        """Run a random transaction."""
+
+    @classmethod
+    def run_transactions_thread(cls, args: tuple) -> (dict, dict):
+        """
+        Run transactions from the transactions_map using passed data.
+        All of the following params are passed as one tuple to simplify multiprocessing.
+        :param transactions_map: List of tuples tu run transactions (from_node_id, to_node_id)
+        :param wallets: Dict of wallets with node_id as a key.
+        :param bills: Dict of bills from wallets with bill_id as a key.
+        :return: (wallets, bills) <- New bills and wallets after the transaction.
+        """
+        transactions_map, wallets, bills = args
+        for from_node_id, to_node_id in transactions_map:
+            # Get balance.
+            amount = cls.get_balance_static(from_node_id, wallets, bills) * random.uniform(0.01, 1.0) ** 2
+
+            # Perform the transaction.
+            cls.send_amount(from_node_id, to_node_id, amount, wallets, bills)
+
+            # Merge bills.
+            cls.merge_nodes_bills(to_node_id, wallets, bills)
+
+        return wallets, bills
+
+    def transactions_run(self):
+        """Run a random set of transaction on the existing nodes in parallel."""
         # Pick the nodes for the transaction.
-        from_node_id = random.randrange(self.NODES)
-        to_node_id = self.pick_recipient(from_node_id)
+        # TODO: This is too uniform. You can switch it to a more sporadic approach.
+        from_nodes = [x for x in range(self.NODES)]
+        random.shuffle(from_nodes)
 
-        # Pick amount.
-        amount = self.get_balance(from_node_id) * random.uniform(0.01, 1.0) ** 2
+        # Generate recipients.
+        # from_node_id = random.randrange(self.NODES)
+        to_nodes = [self.pick_recipient(x) for x in from_nodes]
 
-        # Perform the transaction.
-        self.send_amount(from_node_id, to_node_id,amount, check_balance=False)
+        # Prep service vars.
+        node_to_bucket = {}
+        # Transactions mappings (from node id, to node id)
+        transactions_buckets = [[] for _ in range(self.PROCESSES)]
+        # Node IDs that this bucket would interact with.
+        nodes_buckets = [set() for _ in range(self.PROCESSES)]
 
-        # Merge bills for the receiver.
-        self.merge_nodes_bills(to_node_id)
+        for i in range(self.NODES):
+            from_node_id = from_nodes[i]
+            from_node_bucket = node_to_bucket[from_node_id] if from_node_id in node_to_bucket.keys() else None
+            to_node_id = to_nodes[i]
+            to_node_bucket = node_to_bucket[to_node_id] if to_node_id in node_to_bucket.keys() else None
+
+            if from_node_bucket is None and to_node_bucket is None:
+                from_node_bucket = i % self.PROCESSES
+                to_node_bucket = from_node_bucket
+            elif from_node_bucket and to_node_bucket is None:
+                to_node_bucket = from_node_bucket
+            elif from_node_bucket is None and to_node_bucket:
+                from_node_bucket = to_node_bucket
+            elif from_node_bucket == to_node_bucket:
+                # All the buckets are already assigned properly.
+                pass
+            else:
+                # Nodes are already in different buckets, the transaction is a no go.
+                continue
+
+            # Save the bucket mapping.
+            node_to_bucket[from_node_id] = from_node_bucket
+            node_to_bucket[to_node_id] = to_node_bucket
+
+            # At this point from_node_bucket = to_node_bucket
+            transactions_buckets[from_node_bucket].append(
+                (from_node_id, to_node_id)
+            )
+
+            # Save the IDs into the mapping.
+            nodes_buckets[from_node_bucket].update([from_node_id, to_node_id])
+
+        # Split the data and run transactions.
+        # List with process id as a pointer to the same structure as self.wallets
+        wallets_split = [{} for _ in range(self.PROCESSES)]
+        # List with process id as a pointer to the same structure as self.bills
+        bills_split = [{} for _ in range(self.PROCESSES)]
+
+        for node_id, bucket_id in node_to_bucket.items():
+            wallets_split[bucket_id][node_id] = self.wallets[node_id]
+            for bill_id in wallets_split[bucket_id][node_id]:
+                bills_split[bucket_id][bill_id] = self.bills[bill_id]
+
+        # Run transactions in parallel.
+        # Arguments prep.
+        parallel_args = []
+        for i in range(self.PROCESSES):
+            parallel_args.append(
+                (transactions_buckets[i], wallets_split[i], bills_split[i])
+            )
+        # Run transactions. Choose the method below and comment one out.
+        # In parallel:
+        with Pool(self.PROCESSES) as pool:
+            parallel_res = pool.map(self.run_transactions_thread, parallel_args)
+        # # In one thread sequentially:
+        # parallel_res = []
+        # for i in range(len(parallel_args)):
+        #     parallel_res.append(
+        #         self.run_transactions_thread(parallel_args[i])
+        #     )
+
+        # Merge the data back to the main pull.
+        # Re-save the bills of the nodes that did not participate in this run.
+        new_bills = {}
+        not_participating_nodes = set([x for x in range(self.NODES)]) - set(node_to_bucket.keys())
+        for node_id in not_participating_nodes:
+            for bill_id in self.wallets[node_id]:
+                new_bills[bill_id] = self.bills[bill_id]
+
+        for node_id, bucket_id in node_to_bucket.items():
+            # Update the wallets.
+            self.wallets[node_id] = parallel_res[bucket_id][0][node_id]     # [0] is wallets
+
+            # Update bills from these wallets.
+            for bill_id in self.wallets[node_id]:
+                new_bills[bill_id] = parallel_res[bucket_id][1][bill_id]    # [1] is bills
+
+        # Flush bills into the common pull.
+        self.bills = new_bills
 
     def pick_recipient(self, node_id):
         """Pick a recipient for a transaction from node_id."""
@@ -125,20 +238,24 @@ class Simulator:
             return random.choice(list(self.b_receivers[node_id]))
 
     def system_status(self):
-        print("{} nodes.".format(len(self.nodes_loc)))
-        print("Mean friends per person: {}".format(mean([len(self.p_receivers[i]) for i in range(self.NODES)])))
-        print("Mean businesses per person: {}".format(mean([len(self.b_receivers[i]) for i in range(self.NODES)])))
+        global log
+
+        log.info("---------System Status---------")
+        log.info("{} nodes.".format(len(self.nodes_loc)))
+        log.info("Mean friends per person: {}".format(mean([len(self.p_receivers[i]) for i in range(self.NODES)])))
+        log.info("Mean businesses per person: {}".format(mean([len(self.b_receivers[i]) for i in range(self.NODES)])))
 
         totals = [self.bills[x]['size'] for x in self.bills.keys()]
-        print("{}$ in the system.".format(sum(totals)/100))
-        print("Mean bill size ${}".format(mean(totals)/100))
-        print("Total bills: {}".format(len(self.bills.keys())))
-        print("Avg bills per person: {}".format(len(self.bills.keys())/self.NODES))
+        log.info("{}$ in the system.".format(sum(totals)/100))
+        log.info("Mean bill size ${}".format(mean(totals)/100))
+        log.info("Total bills: {}".format(len(self.bills.keys())))
+        log.info("Avg bills per person: {}".format(len(self.bills.keys())/self.NODES))
 
         wealth = [sum([self.bills[x]['size'] for x in self.wallets[i]]) for i in range(self.NODES)]
-        print("Mean wealth per person ${}".format(mean(wealth)/100))
-        print("Max wealth: ${}".format(max(wealth)/100))
-        print("Min wealth: ${}".format(min(wealth)/100))
+        log.info("Mean wealth per person ${}".format(mean(wealth)/100))
+        log.info("Max wealth: ${}".format(max(wealth)/100))
+        log.info("Min wealth: ${}".format(min(wealth)/100))
+        log.info("-------------------------------")
 
     def close_dist(self, distance):
         """Returns True if the distance is close."""
@@ -162,9 +279,10 @@ class Simulator:
         distribution = truncnorm((low - mid) / sd, (upp - mid) / sd, loc=mid, scale=sd)
         return distribution.rvs().round().astype(int)
 
-    def node_to_cluster(self, node_id: int) -> int:
+    @classmethod
+    def node_to_cluster(cls, node_id: int) -> int:
         """Get cluster_id that node_id belongs to."""
-        return node_id // self.NODES_PER_CLUSTER
+        return node_id // cls.NODES_PER_CLUSTER
 
     def distance_between_nodes(self, node_id_from: int, node_id_to: int) -> float:
         """Get distance between two node IDs."""
@@ -331,70 +449,107 @@ class Simulator:
         """Get mathematical distance between 2 integers."""
         return bin(id1 ^ id2).count("1")
 
-    def send_amount(self, from_node_id: int, to_node_id: int, amount: float, check_balance: bool = True) -> bool:
+    @classmethod
+    def send_amount(cls, from_node_id: int, to_node_id: int, amount: float, wallets: dict, bills: dict) -> bool:
         """
         Send an amount from one node to another.
         :param from_node_id:
         :param to_node_id:
         :param amount:
-        :param check_balance: True - checks balance before sending anything. False - starts sending regardless.
+        :param wallets: Gets updated by a reference.
+        :param bills: Gets updated by a reference.
         :return: True - Amount sent. False - balance is too low.
         """
-        # Check if the node has enough money for the transaction.
-        if check_balance:
-            if self.get_balance(from_node_id) < amount:
-                return False
+        # We assume that the balance is correct and we do not need to check it.
+        # if check_balance:
+        #     if self.get_balance(from_node_id) < amount:
+        #         return False
 
-        to_cluster_id = self.node_to_cluster(to_node_id)
-        from_cluster_id = self.node_to_cluster(from_node_id)
-        self.wallets[from_node_id] = sorted(
-            self.wallets[from_node_id],
+        to_cluster_id = cls.node_to_cluster(to_node_id)
+        from_cluster_id = cls.node_to_cluster(from_node_id)
+        wallets[from_node_id] = sorted(
+            wallets[from_node_id],
             key=lambda x: (
                 # Sort by distance to the receiver's cluster first, excluding bills in sender's cluster.
-                float("inf") if self.bills[x]['cluster'] == from_cluster_id else Simulator.bit_distance(
-                    self.bills[x]['cluster'],
+                float("inf") if bills[x]['cluster'] == from_cluster_id else Simulator.bit_distance(
+                    bills[x]['cluster'],
                     to_cluster_id,
                 ),
-                self.bills[x]['size'],  # Sort by the smallest bill size second.
+                bills[x]['size'],  # Sort by the smallest bill size second.
             ),
             reverse=True,   # So we can pop the bills from the end.
         )
 
         amount_left_to_send = amount
         # Sending until we ren out of the needed amount or bills.
-        while amount_left_to_send and len(self.wallets[from_node_id]):
+        while amount_left_to_send and len(wallets[from_node_id]):
             # Take the bill that we are operating with.
-            bill_id = self.wallets[from_node_id].pop()
+            bill_id = wallets[from_node_id].pop()
 
             # If the bill is not enough to cover the transaction, we send the whole bill.
-            if self.bills[bill_id]['size'] < amount_left_to_send:
-                amount_left_to_send -= self.bills[bill_id]['size']
-
+            if bills[bill_id]['size'] <= amount_left_to_send:
                 # Send the whole bill.
-                self.bills[bill_id]['owner'] = to_node_id
-                self.wallets[to_node_id].append(bill_id)
+                bills[bill_id]['owner'] = to_node_id
+                wallets[to_node_id].append(bill_id)
+
+                amount_left_to_send -= bills[bill_id]['size']
             # If the bill is more than we need, we split it and send a part.
             else:
-                amount_left_to_send = 0.0
-                new_bill_id, new_bill, bill = self.split_bill(self.bills[bill_id], amount_left_to_send)
+                new_bill_id, new_bill, bill = cls.split_bill(bills[bill_id], amount_left_to_send)
 
                 # Return chopped bill back to the owner.
-                self.bills[bill_id] = bill
-                self.wallets[from_node_id].append(bill_id)
+                bills[bill_id] = bill
+                wallets[from_node_id].append(bill_id)
 
                 # Send the new bill.
                 new_bill['owner'] = to_node_id
-                self.bills[new_bill_id] = new_bill
-                self.wallets[to_node_id].append(new_bill_id)
+                bills[new_bill_id] = new_bill
+                wallets[to_node_id].append(new_bill_id)
 
-    def get_balance(self, node_id: int) -> float:
-        """Get balance of specified node."""
+                amount_left_to_send = 0.0
+
+                cls.check_wallet(wallets, bills, from_node_id, "Error in the senders wallet.")
+                cls.check_wallet(wallets, bills, to_node_id, "Error in the receiver's wallet.")
+
+    @staticmethod
+    def check_wallet(wallets, bills, owner_id, msg=""):
+        """
+        Checks if all the bills in the wallet belong to their owner.
+        :param wallets:
+        :param bills:
+        :param owner_id: Node ID
+        :param msg: Optional message before the error output.
+        :return:
+        """
+        global log
+
+        for bill_id in wallets[owner_id]:
+            if bills[bill_id]['owner'] != owner_id:
+                if msg:
+                    log.error(msg)
+                log.error(
+                    "Bill #{} is in the wallet of Node ID #{}, but has the owner set to #{}. Bill: {}".format(
+                        bill_id,
+                        owner_id,
+                        bills[bill_id]['owner'],
+                        bills[bill_id],
+                    )
+                )
+
+    @staticmethod
+    def get_balance_static(node_id: int, wallets: dict, bills: dict) -> float:
+        """Get balance of a specified node using passed data."""
         total = 0.0
-        for bill_id in self.wallets[node_id]:
-            total += self.bills[bill_id]['size']
+        for bill_id in wallets[node_id]:
+            total += bills[bill_id]['size']
         return total
 
-    def get_next_bill_id(self):
+    def get_balance(self, node_id: int) -> float:
+        """Get balance of a specified node."""
+        return self.get_balance_static(node_id, self.wallets, self.bills)
+
+    @staticmethod
+    def get_next_bill_id():
         """Returns the next bill ID. Thread safe."""
         global next_bill_id
 
@@ -402,40 +557,67 @@ class Simulator:
         next_bill_id.value += 1
         return next_id
 
-    def merge_nodes_bills(self, node_id):
-        """Combines all node's bills that can be combined."""
+    @classmethod
+    def merge_nodes_bills(cls, node_id: int, wallets: dict, bills: dict):
+        """
+        Combines all node's bills that can be combined.
+        :param node_id: Node ID for which we are trying to merge the bills.
+        :param wallets: Gets updated by reference.
+        :param bills: Gets updated by reference.
+        :return:
+        """
 
         # Sort all node's bills by cluster_id.
-        self.wallets[node_id] = sorted(self.wallets[node_id], key=lambda x: self.bills[x]['cluster'])
+        wallets[node_id] = sorted(wallets[node_id], key=lambda x: bills[x]['cluster'])
 
         # Iterate over all bills and see if any could be combined.
         i = 1
-        while i < len(self.wallets[node_id]):
-            bill1_id = self.wallets[node_id][i-1]
-            bill2_id = self.wallets[node_id][i]
+        while i < len(wallets[node_id]):
+            bill1_id = wallets[node_id][i-1]
+            bill2_id = wallets[node_id][i]
 
-            if self.bills[bill1_id]['cluster'] == self.bills[bill2_id]['cluster']:
+            if bills[bill1_id]['cluster'] == bills[bill2_id]['cluster']:
                 # This will combine the bills and remove second id from the wallet, so no need to iterate i.
-                self.combine_two_bills(bill1_id, bill2_id)
+                cls.combine_two_bills(bill1_id, bill2_id, wallets, bills)
             else:
                 i += 1
 
-    def combine_two_bills(self, bill1_id, bill2_id):
-        """Combines two bills into the first one. Can only be done for the same owner on the same cluster."""
+    @staticmethod
+    def combine_two_bills(bill1_id, bill2_id, wallets, bills):
+        """
+        Combines two bills into the first one. Can only be done for the same owner on the same cluster.
+        :param bill1_id: Bill ID of the first bill to merge.
+        :param bill2_id: Bill ID of the second bill to merge.
+        :param wallets: Gets updated by reference.
+        :param bills: Gets updated by reference.
+        :return:
+        """
+        global log
 
-        assert self.bills[bill1_id]['owner'] == self.bills[bill2_id]['owner']
-        assert self.bills[bill1_id]['cluster'] == self.bills[bill2_id]['cluster']
+        # assert bills[bill1_id]['owner'] == bills[bill2_id]['owner']
+        if bills[bill1_id]['owner'] != bills[bill2_id]['owner']:
+            # log.warning("Trying to combine bills by different owners.")
+            # log.warning("Bill 1: {}".format(bills[bill1_id]))
+            # log.warning("Bill 2: {}".format(bills[bill2_id]))
+            return
+        # assert bills[bill1_id]['cluster'] == bills[bill2_id]['cluster']
+        if bills[bill1_id]['cluster'] != bills[bill2_id]['cluster']:
+            # log.warning("Trying to combine bills that are not in the same cluster.")
+            # log.warning("Bill 1: {}".format(bills[bill1_id]))
+            # log.warning("Bill 2: {}".format(bills[bill2_id]))
+            return
 
         # Add the value from 2 to 1 bill.
-        self.bills[bill1_id]['size'] += self.bills[bill2_id]['size']
+        bills[bill1_id]['size'] += bills[bill2_id]['size']
 
         # Delete bill 2 from user's wallet.
-        self.wallets[self.bills[bill2_id]['owner']].remove(bill2_id)
+        wallets[bills[bill2_id]['owner']].remove(bill2_id)
 
         # Delete bill2
-        del self.bills[bill2_id]
+        del bills[bill2_id]
 
-    def split_bill(self, bill, amount_needed):
+    @classmethod
+    def split_bill(cls, bill, amount_needed):
         """
         Splits a bill into two. One of the amount needed. Thread safe.
         You need to do the following with the returned values:
@@ -460,7 +642,7 @@ class Simulator:
             'cluster': bill['cluster'],
         }
         return (
-            self.get_next_bill_id(),
+            cls.get_next_bill_id(),
             new_bill,
             bill,
         )
@@ -468,6 +650,6 @@ class Simulator:
 
 if __name__ == '__main__':
     simulator = Simulator()
-    simulator.run()
+    simulator.run(10)
     simulator.system_status()
 
