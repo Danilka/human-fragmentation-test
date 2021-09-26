@@ -1,7 +1,6 @@
-import copy
-from multiprocessing import Pool, Value
+from multiprocessing import Pool
 import math
-import numpy as np
+from sys import getsizeof
 import random
 from timer_cm import Timer
 from scipy.stats import truncnorm
@@ -9,15 +8,15 @@ from statistics import mean
 import logging
 
 
+logging.basicConfig(level=logging.DEBUG)
 log = logging.getLogger(__name__)
-next_bill_id = Value('i', 0)
 
 
 class Simulator:
 
     PROCESSES = 7
 
-    CLUSTERS = 64  # *256
+    CLUSTERS = 32 * 16  # *256
     NODES_PER_CLUSTER = 16
     NODES = CLUSTERS * NODES_PER_CLUSTER
     BUSINESSES_PERCENT = 0.05  # float % from 0 to 1
@@ -52,6 +51,13 @@ class Simulator:
         # {node id} -> (x, y)
         # Coordinates are saved in float
         self.nodes_loc = {}
+
+        # Next bill ID counter.
+        self.next_bill_id = 0
+
+        # List of available bill IDs to use.
+        # [future_bill_id, future_bill_id2, ...]
+        self.free_bill_ids = []
 
         # {bill_id} -> {size: 123, owner: node_id, cluster: cluster_id}
         self.bills = {}
@@ -97,15 +103,12 @@ class Simulator:
         with Timer('Generate bills'):
             self.generate_bills()
 
-        self.system_status()
-
     def run(self, transactions: int = 1000):
         global log
 
         for i in range(transactions):
             with Timer("Transactions run #{}".format(i)):
                 self.transactions_run()
-
 
     @classmethod
     def run_transactions_thread(cls, args: tuple) -> (dict, dict):
@@ -115,23 +118,26 @@ class Simulator:
         :param transactions_map: List of tuples tu run transactions (from_node_id, to_node_id)
         :param wallets: Dict of wallets with node_id as a key.
         :param bills: Dict of bills from wallets with bill_id as a key.
-        :return: (wallets, bills) <- New bills and wallets after the transaction.
+        :param free_bill_ids: List of free bill ids to use.
+        :return: (wallets, bills, free_bill_ids) <- New bills, wallets, and free_bill_ids after the transaction.
         """
-        transactions_map, wallets, bills = args
+        transactions_map, wallets, bills, free_bill_ids = args
+
         for from_node_id, to_node_id in transactions_map:
             # Get balance.
             amount = cls.get_balance_static(from_node_id, wallets, bills) * random.uniform(0.01, 1.0) ** 2
 
             # Perform the transaction.
-            cls.send_amount(from_node_id, to_node_id, amount, wallets, bills)
+            cls.send_amount(from_node_id, to_node_id, amount, wallets, bills, free_bill_ids)
 
             # Merge bills.
-            cls.merge_nodes_bills(to_node_id, wallets, bills)
+            free_bill_ids += cls.merge_nodes_bills(to_node_id, wallets, bills)
 
-        return wallets, bills
+        return wallets, bills, free_bill_ids
 
     def transactions_run(self):
         """Run a random set of transaction on the existing nodes in parallel."""
+
         # Pick the nodes for the transaction.
         # TODO: This is too uniform. You can switch it to a more sporadic approach.
         from_nodes = [x for x in range(self.NODES)]
@@ -180,6 +186,24 @@ class Simulator:
             # Save the IDs into the mapping.
             nodes_buckets[from_node_bucket].update([from_node_id, to_node_id])
 
+        # Prepare free bill_ids for each bucket.
+        # At most each thread will need as many IDs as # of transactions.
+        free_bill_ids_buckets = []
+        for i in range(self.PROCESSES):
+
+            free_bill_ids_buckets.append([])
+            ids_count = len(transactions_buckets[i])
+
+            # First we use up free IDs.
+            while self.free_bill_ids and ids_count > 0:
+                free_bill_ids_buckets[i].append(self.free_bill_ids.pop())
+                ids_count -= 1
+
+            while ids_count > 0:
+                free_bill_ids_buckets[i].append(self.next_bill_id)
+                self.next_bill_id += 1
+                ids_count -= 1
+
         # Split the data and run transactions.
         # List with process id as a pointer to the same structure as self.wallets
         wallets_split = [{} for _ in range(self.PROCESSES)]
@@ -196,7 +220,7 @@ class Simulator:
         parallel_args = []
         for i in range(self.PROCESSES):
             parallel_args.append(
-                (transactions_buckets[i], wallets_split[i], bills_split[i])
+                (transactions_buckets[i], wallets_split[i], bills_split[i], free_bill_ids_buckets[i])
             )
         # Run transactions. Choose the method below and comment one out.
         # In parallel:
@@ -223,7 +247,12 @@ class Simulator:
 
             # Update bills from these wallets.
             for bill_id in self.wallets[node_id]:
+                if bill_id in new_bills.keys():
+                    log.error("Trying to overwrite bill ID #{}".format(bill_id))
                 new_bills[bill_id] = parallel_res[bucket_id][1][bill_id]    # [1] is bills
+
+            # Save free bill_ids back into the main bucket.
+            self.free_bill_ids += parallel_res[bucket_id][2]    # [2] is free_bill_ids
 
         # Flush bills into the common pull.
         self.bills = new_bills
@@ -399,7 +428,6 @@ class Simulator:
         return bills_part
 
     def generate_bills(self):
-        global next_bill_id
 
         with Pool(self.PROCESSES) as pool:
             totals = pool.starmap(self.get_asymmetric_norm, [(self.NET_WORTH_MIN, self.NET_WORTH_AVG, self.NET_WORTH_MAX) for _ in range(self.NODES)])
@@ -419,8 +447,8 @@ class Simulator:
                 node_bill_ids.append(total_bills-1)
             bill_ids.append(node_bill_ids)
 
-        # Set global counter to the next bill ID (last ID + 1).
-        next_bill_id.value = bill_ids[-1][-1] + 1
+        # Set next bill ID counter to the next bill ID (last ID + 1).
+        self.next_bill_id = bill_ids[-1][-1] + 1
 
         # Generate bills in parallel.
         with Pool(self.PROCESSES) as pool:
@@ -450,7 +478,15 @@ class Simulator:
         return bin(id1 ^ id2).count("1")
 
     @classmethod
-    def send_amount(cls, from_node_id: int, to_node_id: int, amount: float, wallets: dict, bills: dict) -> bool:
+    def send_amount(
+        cls,
+        from_node_id: int,
+        to_node_id: int,
+        amount: float,
+        wallets: dict,
+        bills: dict,
+        free_bill_ids: list
+    ):
         """
         Send an amount from one node to another.
         :param from_node_id:
@@ -458,6 +494,7 @@ class Simulator:
         :param amount:
         :param wallets: Gets updated by a reference.
         :param bills: Gets updated by a reference.
+        :param free_bill_ids: List of free_bill_ids that can be used to split the bills.
         :return: True - Amount sent. False - balance is too low.
         """
         # We assume that the balance is correct and we do not need to check it.
@@ -495,21 +532,25 @@ class Simulator:
                 amount_left_to_send -= bills[bill_id]['size']
             # If the bill is more than we need, we split it and send a part.
             else:
-                new_bill_id, new_bill, bill = cls.split_bill(bills[bill_id], amount_left_to_send)
+                new_bill_id = free_bill_ids.pop()
+                new_bill, bill = cls.split_bill(bills[bill_id], amount_left_to_send)
 
                 # Return chopped bill back to the owner.
-                bills[bill_id] = bill
+                # bills[bill_id] = bill
+                # bills[bill_id]['size'] = old_bill['size']
                 wallets[from_node_id].append(bill_id)
 
                 # Send the new bill.
                 new_bill['owner'] = to_node_id
+                if new_bill_id in bills.keys():
+                    log.error("{} was just generated, but already exists in bills.".format(new_bill_id))
                 bills[new_bill_id] = new_bill
                 wallets[to_node_id].append(new_bill_id)
 
                 amount_left_to_send = 0.0
 
-                cls.check_wallet(wallets, bills, from_node_id, "Error in the senders wallet.")
-                cls.check_wallet(wallets, bills, to_node_id, "Error in the receiver's wallet.")
+                # cls.check_wallet(wallets, bills, from_node_id, "Error in the senders wallet.")
+                # cls.check_wallet(wallets, bills, to_node_id, "Error in the receiver's wallet.")
 
     @staticmethod
     def check_wallet(wallets, bills, owner_id, msg=""):
@@ -525,10 +566,9 @@ class Simulator:
 
         for bill_id in wallets[owner_id]:
             if bills[bill_id]['owner'] != owner_id:
-                if msg:
-                    log.error(msg)
                 log.error(
-                    "Bill #{} is in the wallet of Node ID #{}, but has the owner set to #{}. Bill: {}".format(
+                    "{} Bill #{} is in the wallet of Node ID #{}, but has the owner set to #{}. Bill: {}".format(
+                        msg,
                         bill_id,
                         owner_id,
                         bills[bill_id]['owner'],
@@ -548,24 +588,18 @@ class Simulator:
         """Get balance of a specified node."""
         return self.get_balance_static(node_id, self.wallets, self.bills)
 
-    @staticmethod
-    def get_next_bill_id():
-        """Returns the next bill ID. Thread safe."""
-        global next_bill_id
-
-        next_id = next_bill_id.value
-        next_bill_id.value += 1
-        return next_id
-
     @classmethod
-    def merge_nodes_bills(cls, node_id: int, wallets: dict, bills: dict):
+    def merge_nodes_bills(cls, node_id: int, wallets: dict, bills: dict) -> list:
         """
         Combines all node's bills that can be combined.
         :param node_id: Node ID for which we are trying to merge the bills.
         :param wallets: Gets updated by reference.
         :param bills: Gets updated by reference.
-        :return:
+        :return: List of released Bill IDs.
         """
+
+        # List of released Bill IDs.
+        released_bill_ids = []
 
         # Sort all node's bills by cluster_id.
         wallets[node_id] = sorted(wallets[node_id], key=lambda x: bills[x]['cluster'])
@@ -578,9 +612,11 @@ class Simulator:
 
             if bills[bill1_id]['cluster'] == bills[bill2_id]['cluster']:
                 # This will combine the bills and remove second id from the wallet, so no need to iterate i.
-                cls.combine_two_bills(bill1_id, bill2_id, wallets, bills)
+                released_bill_ids.append(cls.combine_two_bills(bill1_id, bill2_id, wallets, bills))
             else:
                 i += 1
+
+        return released_bill_ids
 
     @staticmethod
     def combine_two_bills(bill1_id, bill2_id, wallets, bills):
@@ -590,7 +626,7 @@ class Simulator:
         :param bill2_id: Bill ID of the second bill to merge.
         :param wallets: Gets updated by reference.
         :param bills: Gets updated by reference.
-        :return:
+        :return: Released Bill ID. It needs to be saved into self.next_bill_ids
         """
         global log
 
@@ -616,6 +652,9 @@ class Simulator:
         # Delete bill2
         del bills[bill2_id]
 
+        # Return released bill ID.
+        return bill2_id
+
     @classmethod
     def split_bill(cls, bill, amount_needed):
         """
@@ -626,7 +665,7 @@ class Simulator:
         3. Add the new bill to owner's wallet.
         :param bill: Old bill object.
         :param amount_needed: Float of the amount of the new bill (less than the old bill).
-        :return: (new bill id, new bill object, updated old bill)
+        :return: (new bill object, updated old bill)
         """
 
         assert amount_needed < bill['size']
@@ -642,7 +681,6 @@ class Simulator:
             'cluster': bill['cluster'],
         }
         return (
-            cls.get_next_bill_id(),
             new_bill,
             bill,
         )
@@ -650,6 +688,14 @@ class Simulator:
 
 if __name__ == '__main__':
     simulator = Simulator()
+    simulator.system_status()
+
+    print("Wallets size: {} MB, Bills size: {} MB, Business receivers: {} MB, Private receivers: {} MB".format(
+        getsizeof(simulator.wallets)/1000000,
+        getsizeof(simulator.bills)/1000000,
+        getsizeof(simulator.b_receivers)/1000000,
+        getsizeof(simulator.p_receivers)/1000000,
+    ))
     simulator.run(10)
     simulator.system_status()
 
