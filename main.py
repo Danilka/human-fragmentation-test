@@ -47,7 +47,10 @@ class Simulator:
     # What is considered to be a close distance between nodes.
     CLOSE_DISTANCE_RADIUS = (MAX_X + MAX_Y) * 0.01  # 1% of the side.
 
-    def __init__(self):
+    def __init__(self, debug=False):
+
+        self.DEBUG = debug
+
         # {node id} -> (x, y)
         # Coordinates are saved in float
         self.nodes_loc = {}
@@ -61,6 +64,10 @@ class Simulator:
 
         # {bill_id} -> {size: 123, owner: node_id, cluster: cluster_id}
         self.bills = {}
+        # {bill_id} -> 123.45
+        self.bills_size = {}
+        # {bill_id} -> 12
+        self.bills_cluster = {}
 
         # {owner_id} -> [bill_id, bill_id, ...]
         self.wallets = {}
@@ -117,23 +124,24 @@ class Simulator:
         All of the following params are passed as one tuple to simplify multiprocessing.
         :param transactions_map: List of tuples tu run transactions (from_node_id, to_node_id)
         :param wallets: Dict of wallets with node_id as a key.
-        :param bills: Dict of bills from wallets with bill_id as a key.
+        :param bills_size: Dict of bills sizes from self.bills_size with bill_id as a key.
+        :param bills_cluster: Dict of bills clusters from self.bills_cluster with bill_id as a key.
         :param free_bill_ids: List of free bill ids to use.
-        :return: (wallets, bills, free_bill_ids) <- New bills, wallets, and free_bill_ids after the transaction.
+        :return: (wallets, bills_size, bills_cluster, free_bill_ids) <- New wallets, bills_size, bills_cluster, and free_bill_ids after the transaction.
         """
-        transactions_map, wallets, bills, free_bill_ids = args
+        transactions_map, wallets, bills_size, bills_cluster, free_bill_ids = args
 
         for from_node_id, to_node_id in transactions_map:
             # Get balance.
-            amount = cls.get_balance_static(from_node_id, wallets, bills) * random.uniform(0.01, 1.0) ** 2
+            amount = cls.get_balance_static(from_node_id, wallets, bills_size) * random.uniform(0.01, 1.0) ** 2
 
             # Perform the transaction.
-            cls.send_amount(from_node_id, to_node_id, amount, wallets, bills, free_bill_ids)
+            cls.send_amount(from_node_id, to_node_id, amount, wallets, bills_size, bills_cluster, free_bill_ids)
 
             # Merge bills.
-            free_bill_ids += cls.merge_nodes_bills(to_node_id, wallets, bills)
+            free_bill_ids += cls.merge_nodes_bills(to_node_id, wallets, bills_size, bills_cluster)
 
-        return wallets, bills, free_bill_ids
+        return wallets, bills_size, bills_cluster, free_bill_ids
 
     def transactions_run(self):
         """Run a random set of transaction on the existing nodes in parallel."""
@@ -207,20 +215,28 @@ class Simulator:
         # Split the data and run transactions.
         # List with process id as a pointer to the same structure as self.wallets
         wallets_split = [{} for _ in range(self.PROCESSES)]
-        # List with process id as a pointer to the same structure as self.bills
-        bills_split = [{} for _ in range(self.PROCESSES)]
+        # List with process id as a pointer to the same structure as self.bills_size and self.bills_cluster
+        bills_cluster_split = [{} for _ in range(self.PROCESSES)]
+        bills_size_split = [{} for _ in range(self.PROCESSES)]
 
         for node_id, bucket_id in node_to_bucket.items():
             wallets_split[bucket_id][node_id] = self.wallets[node_id]
             for bill_id in wallets_split[bucket_id][node_id]:
-                bills_split[bucket_id][bill_id] = self.bills[bill_id]
+                bills_size_split[bucket_id][bill_id] = self.bills_size[bill_id]
+                bills_cluster_split[bucket_id][bill_id] = self.bills_cluster[bill_id]
 
         # Run transactions in parallel.
         # Arguments prep.
         parallel_args = []
         for i in range(self.PROCESSES):
             parallel_args.append(
-                (transactions_buckets[i], wallets_split[i], bills_split[i], free_bill_ids_buckets[i])
+                (
+                    transactions_buckets[i],
+                    wallets_split[i],
+                    bills_size_split[i],
+                    bills_cluster_split[i],
+                    free_bill_ids_buckets[i]
+                )
             )
         # Run transactions. Choose the method below and comment one out.
         # In parallel:
@@ -235,11 +251,13 @@ class Simulator:
 
         # Merge the data back to the main pull.
         # Re-save the bills of the nodes that did not participate in this run.
-        new_bills = {}
+        new_bills_size = {}
+        new_bills_cluster = {}
         not_participating_nodes = set([x for x in range(self.NODES)]) - set(node_to_bucket.keys())
         for node_id in not_participating_nodes:
             for bill_id in self.wallets[node_id]:
-                new_bills[bill_id] = self.bills[bill_id]
+                new_bills_size[bill_id] = self.bills_size[bill_id]
+                new_bills_cluster[bill_id] = self.bills_cluster[bill_id]
 
         for node_id, bucket_id in node_to_bucket.items():
             # Update the wallets.
@@ -247,15 +265,18 @@ class Simulator:
 
             # Update bills from these wallets.
             for bill_id in self.wallets[node_id]:
-                if bill_id in new_bills.keys():
+                # Check if we are trying to overwrite an existing bill.
+                if self.DEBUG and bill_id in new_bills_size.keys():
                     log.error("Trying to overwrite bill ID #{}".format(bill_id))
-                new_bills[bill_id] = parallel_res[bucket_id][1][bill_id]    # [1] is bills
+                new_bills_size[bill_id] = parallel_res[bucket_id][1][bill_id]    # [1] is bills_size
+                new_bills_cluster[bill_id] = parallel_res[bucket_id][2][bill_id]    # [2] is bills_cluster
 
             # Save free bill_ids back into the main bucket.
-            self.free_bill_ids += parallel_res[bucket_id][2]    # [2] is free_bill_ids
+            self.free_bill_ids += parallel_res[bucket_id][3]    # [3] is free_bill_ids
 
         # Flush bills into the common pull.
-        self.bills = new_bills
+        self.bills_size = new_bills_size
+        self.bills_cluster = new_bills_cluster
 
     def pick_recipient(self, node_id):
         """Pick a recipient for a transaction from node_id."""
@@ -274,13 +295,13 @@ class Simulator:
         log.info("Mean friends per person: {}".format(mean([len(self.p_receivers[i]) for i in range(self.NODES)])))
         log.info("Mean businesses per person: {}".format(mean([len(self.b_receivers[i]) for i in range(self.NODES)])))
 
-        totals = [self.bills[x]['size'] for x in self.bills.keys()]
+        totals = [self.bills_size[x] for x in self.bills_size.keys()]
         log.info("{}$ in the system.".format(sum(totals)/100))
         log.info("Mean bill size ${}".format(mean(totals)/100))
-        log.info("Total bills: {}".format(len(self.bills.keys())))
-        log.info("Avg bills per person: {}".format(len(self.bills.keys())/self.NODES))
+        log.info("Total bills: {}".format(len(self.bills_size.keys())))
+        log.info("Avg bills per person: {}".format(len(self.bills_size.keys())/self.NODES))
 
-        wealth = [sum([self.bills[x]['size'] for x in self.wallets[i]]) for i in range(self.NODES)]
+        wealth = [sum([self.bills_size[x] for x in self.wallets[i]]) for i in range(self.NODES)]
         log.info("Mean wealth per person ${}".format(mean(wealth)/100))
         log.info("Max wealth: ${}".format(max(wealth)/100))
         log.info("Min wealth: ${}".format(min(wealth)/100))
@@ -411,21 +432,18 @@ class Simulator:
         return res
 
     def generate_node_bills(self, bill_ids, total, node_id):
-        bills_part = {}
+        bills_size_part = {}
+        bills_cluster_part = {}
 
         # Split total into specific bills.
         node_bills = self.split_int(total, len(bill_ids))
         for i in range(len(bill_ids)):
             bill_size = float(node_bills[i])
             bill_id = bill_ids[i]
-            # Create a bill.
-            bills_part[bill_id] = {
-                'size': bill_size,
-                'owner': node_id,
-                'cluster': random.randrange(self.CLUSTERS)
-            }
+            bills_size_part[bill_id] = bill_size
+            bills_cluster_part[bill_id] = random.randrange(self.CLUSTERS)
 
-        return bills_part
+        return bills_size_part, bills_cluster_part
 
     def generate_bills(self):
 
@@ -452,12 +470,16 @@ class Simulator:
 
         # Generate bills in parallel.
         with Pool(self.PROCESSES) as pool:
-            nodes_bills = pool.starmap(self.generate_node_bills, [(bill_ids[x], totals[x], x) for x in range(self.NODES)])
+            # res: [node_id] => (bills_size_part, bills_cluster_part)
+            res = pool.starmap(self.generate_node_bills, [(bill_ids[x], totals[x], x) for x in range(self.NODES)])
 
         # Save generated results into global vars.
         for i in range(self.NODES):
-            self.wallets[i] = list(nodes_bills[i].keys())
-            self.bills.update(nodes_bills[i])
+            bills_size_part, bills_cluster_part = res[i]
+            # Save bills IDs into wallets.
+            self.wallets[i] = list(bills_size_part.keys())
+            self.bills_size.update(bills_size_part)
+            self.bills_cluster.update(bills_cluster_part)
 
     @staticmethod
     def split_int(num, n_pieces) -> list:
@@ -484,7 +506,8 @@ class Simulator:
         to_node_id: int,
         amount: float,
         wallets: dict,
-        bills: dict,
+        bills_size: dict,
+        bills_cluster: dict,
         free_bill_ids: list
     ):
         """
@@ -493,7 +516,8 @@ class Simulator:
         :param to_node_id:
         :param amount:
         :param wallets: Gets updated by a reference.
-        :param bills: Gets updated by a reference.
+        :param bills_size: Gets updated by a reference.
+        :param bills_cluster: Gets updated by a reference.
         :param free_bill_ids: List of free_bill_ids that can be used to split the bills.
         :return: True - Amount sent. False - balance is too low.
         """
@@ -508,11 +532,11 @@ class Simulator:
             wallets[from_node_id],
             key=lambda x: (
                 # Sort by distance to the receiver's cluster first, excluding bills in sender's cluster.
-                float("inf") if bills[x]['cluster'] == from_cluster_id else Simulator.bit_distance(
-                    bills[x]['cluster'],
+                float("inf") if bills_cluster[x] == from_cluster_id else Simulator.bit_distance(
+                    bills_cluster[x],
                     to_cluster_id,
                 ),
-                bills[x]['size'],  # Sort by the smallest bill size second.
+                bills_size[x],  # Sort by the smallest bill size second.
             ),
             reverse=True,   # So we can pop the bills from the end.
         )
@@ -524,33 +548,26 @@ class Simulator:
             bill_id = wallets[from_node_id].pop()
 
             # If the bill is not enough to cover the transaction, we send the whole bill.
-            if bills[bill_id]['size'] <= amount_left_to_send:
+            if bills_size[bill_id] <= amount_left_to_send:
                 # Send the whole bill.
-                bills[bill_id]['owner'] = to_node_id
                 wallets[to_node_id].append(bill_id)
 
-                amount_left_to_send -= bills[bill_id]['size']
+                amount_left_to_send -= bills_size[bill_id]
             # If the bill is more than we need, we split it and send a part.
             else:
                 new_bill_id = free_bill_ids.pop()
-                new_bill, bill = cls.split_bill(bills[bill_id], amount_left_to_send)
 
-                # Return chopped bill back to the owner.
-                # bills[bill_id] = bill
-                # bills[bill_id]['size'] = old_bill['size']
+                # Split the bill into two.
+                # Lower first bill's size and save it back.
+                bills_size[bill_id] -= float(amount_left_to_send)
                 wallets[from_node_id].append(bill_id)
-
-                # Send the new bill.
-                new_bill['owner'] = to_node_id
-                if new_bill_id in bills.keys():
-                    log.error("{} was just generated, but already exists in bills.".format(new_bill_id))
-                bills[new_bill_id] = new_bill
+                # Create a new bill with the same size.
+                bills_size[new_bill_id] = amount_left_to_send
+                bills_cluster[new_bill_id] = bills_cluster[bill_id]  # Same cluster as the one we are splitting from.
+                # Save the new bill into the receiver's wallet.
                 wallets[to_node_id].append(new_bill_id)
 
                 amount_left_to_send = 0.0
-
-                # cls.check_wallet(wallets, bills, from_node_id, "Error in the senders wallet.")
-                # cls.check_wallet(wallets, bills, to_node_id, "Error in the receiver's wallet.")
 
     @staticmethod
     def check_wallet(wallets, bills, owner_id, msg=""):
@@ -577,24 +594,25 @@ class Simulator:
                 )
 
     @staticmethod
-    def get_balance_static(node_id: int, wallets: dict, bills: dict) -> float:
+    def get_balance_static(node_id: int, wallets: dict, bills_size: dict) -> float:
         """Get balance of a specified node using passed data."""
         total = 0.0
         for bill_id in wallets[node_id]:
-            total += bills[bill_id]['size']
+            total += bills_size[bill_id]
         return total
 
     def get_balance(self, node_id: int) -> float:
         """Get balance of a specified node."""
-        return self.get_balance_static(node_id, self.wallets, self.bills)
+        return self.get_balance_static(node_id, self.wallets, self.bills_size)
 
     @classmethod
-    def merge_nodes_bills(cls, node_id: int, wallets: dict, bills: dict) -> list:
+    def merge_nodes_bills(cls, node_id: int, wallets: dict, bills_size: dict, bills_cluster: dict) -> list:
         """
         Combines all node's bills that can be combined.
         :param node_id: Node ID for which we are trying to merge the bills.
         :param wallets: Gets updated by reference.
-        :param bills: Gets updated by reference.
+        :param bills_size: Gets updated by reference.
+        :param bills_cluster: Gets updated by reference.
         :return: List of released Bill IDs.
         """
 
@@ -602,7 +620,7 @@ class Simulator:
         released_bill_ids = []
 
         # Sort all node's bills by cluster_id.
-        wallets[node_id] = sorted(wallets[node_id], key=lambda x: bills[x]['cluster'])
+        wallets[node_id] = sorted(wallets[node_id], key=lambda x: bills_cluster[x])
 
         # Iterate over all bills and see if any could be combined.
         i = 1
@@ -610,47 +628,57 @@ class Simulator:
             bill1_id = wallets[node_id][i-1]
             bill2_id = wallets[node_id][i]
 
-            if bills[bill1_id]['cluster'] == bills[bill2_id]['cluster']:
+            if bills_cluster[bill1_id] == bills_cluster[bill2_id]:
                 # This will combine the bills and remove second id from the wallet, so no need to iterate i.
-                released_bill_ids.append(cls.combine_two_bills(bill1_id, bill2_id, wallets, bills))
+                released_bill_ids.append(
+                    cls.combine_two_bills(bill1_id, bill2_id, node_id, wallets, bills_size, bills_cluster)
+                )
             else:
                 i += 1
 
         return released_bill_ids
 
     @staticmethod
-    def combine_two_bills(bill1_id, bill2_id, wallets, bills):
+    def combine_two_bills(bill1_id: int, bill2_id: int, node_id: int, wallets: dict, bills_size: dict, bills_cluster: dict) -> int:
         """
-        Combines two bills into the first one. Can only be done for the same owner on the same cluster.
+        Combines two bills into the first one. This should only be done for the same owner on the same cluster.
         :param bill1_id: Bill ID of the first bill to merge.
         :param bill2_id: Bill ID of the second bill to merge.
+        :param node_id: Bills owner node_id.
         :param wallets: Gets updated by reference.
-        :param bills: Gets updated by reference.
+        :param bills_size: Gets updated by reference.
+        :param bills_cluster: Gets updated by reference.
         :return: Released Bill ID. It needs to be saved into self.next_bill_ids
         """
         global log
 
-        # assert bills[bill1_id]['owner'] == bills[bill2_id]['owner']
-        if bills[bill1_id]['owner'] != bills[bill2_id]['owner']:
-            # log.warning("Trying to combine bills by different owners.")
-            # log.warning("Bill 1: {}".format(bills[bill1_id]))
-            # log.warning("Bill 2: {}".format(bills[bill2_id]))
-            return
-        # assert bills[bill1_id]['cluster'] == bills[bill2_id]['cluster']
-        if bills[bill1_id]['cluster'] != bills[bill2_id]['cluster']:
-            # log.warning("Trying to combine bills that are not in the same cluster.")
-            # log.warning("Bill 1: {}".format(bills[bill1_id]))
-            # log.warning("Bill 2: {}".format(bills[bill2_id]))
-            return
+        if bill1_id not in wallets[node_id] or bill2_id not in wallets[node_id]:
+            raise ValueError(
+                "Trying to combine two bills, but they do not belong to the same owner. "
+                "Bill1 ID {} Bill2 ID {}".format(
+                    bill1_id,
+                    bill2_id,
+                )
+            )
+
+        if bills_cluster[bill1_id] != bills_cluster[bill2_id]:
+            raise ValueError(
+                "Trying to combine two bills, but they do not belong to the same cluster. "
+                "Bill1 ID {} belongs to cluster {} Bill2 ID {} belongs to cluster {}".format(
+                    bill1_id,
+                    bill2_id,
+                    bills_cluster[bill1_id],
+                    bills_cluster[bill2_id],
+                )
+            )
 
         # Add the value from 2 to 1 bill.
-        bills[bill1_id]['size'] += bills[bill2_id]['size']
+        bills_size[bill1_id] += bills_size[bill2_id]
 
-        # Delete bill 2 from user's wallet.
-        wallets[bills[bill2_id]['owner']].remove(bill2_id)
-
-        # Delete bill2
-        del bills[bill2_id]
+        # Delete Bill 2 info.
+        wallets[node_id].remove(bill2_id)
+        del(bills_size[bill2_id])
+        del(bills_cluster[bill2_id])
 
         # Return released bill ID.
         return bill2_id
@@ -687,15 +715,16 @@ class Simulator:
 
 
 if __name__ == '__main__':
-    simulator = Simulator()
+    simulator = Simulator(debug=True)
     simulator.system_status()
 
-    print("Wallets size: {} MB, Bills size: {} MB, Business receivers: {} MB, Private receivers: {} MB".format(
+    print("Wallets size: {} MB, Bills_size size: {} MB, Bills_cluster size: {} MB, Business receivers: {} MB, Private receivers: {} MB".format(
         getsizeof(simulator.wallets)/1000000,
-        getsizeof(simulator.bills)/1000000,
+        getsizeof(simulator.bills_size)/1000000,
+        getsizeof(simulator.bills_cluster)/1000000,
         getsizeof(simulator.b_receivers)/1000000,
         getsizeof(simulator.p_receivers)/1000000,
     ))
-    simulator.run(10)
+    simulator.run(2)
     simulator.system_status()
 
