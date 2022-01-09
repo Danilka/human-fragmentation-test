@@ -1,3 +1,4 @@
+from collections import defaultdict
 from multiprocessing import Pool
 import math
 from sys import getsizeof
@@ -17,18 +18,21 @@ class Simulator:
 
     PROCESSES = 7
 
-    CLUSTERS = 16 * 16  # *256
+    CLUSTERS = 16 * 256  # *256
     NODES_PER_CLUSTER = 16
     NODES = CLUSTERS * NODES_PER_CLUSTER
     BUSINESSES_PERCENT = 0.05  # float % from 0 to 1
 
     TRANSACTIONS_P2P_PERCENT = 0.2  # float % from 0 to 1
     TRANSACTIONS_P2B_PERCENT = 0.8  # float % from 0 to 1
+
+    # Regulated by the total number of transaction runs at the moment.
     TRANSACTIONS_P2P_UNIQUE = 50  # Number of people that any person interacts with
     TRANSACTIONS_P2B_UNIQUE = 50  # Number of businesses that any person interacts with
-    TRANSACTIONS_PER_PERSON_AVG = 1000
-    TRANSACTIONS_PER_PERSON_MIN = 500
-    TRANSACTIONS_PER_PERSON_MAX = 5000
+    # TRANSACTIONS_PER_PERSON_AVG = 1000  # Per year
+    # TRANSACTIONS_PER_PERSON_MIN = 500   # Per year
+    # TRANSACTIONS_PER_PERSON_MAX = 5000  # Per year
+
     TRANSACTION_SIZE_MIN = 0.001  # float % from net worth [0; 1]
     TRANSACTION_SIZE_MAX = 0.1  # float % from net worth [0; 1]
 
@@ -38,23 +42,37 @@ class Simulator:
 
     # Bills per person
     BILLS_PP_MIN = 2
-    BILLS_PP_AVG = 500
-    BILLS_PP_MAX = 100000
+    BILLS_PP_AVG = 50
+    BILLS_PP_MAX = 1000
 
     # X and Y field coordinate boundaries.
-    MAX_X = 1000
-    MAX_Y = MAX_X
+    MAX_FIELD_SIDE = 1000
 
     # What is considered to be a close distance between nodes.
-    CLOSE_DISTANCE_RADIUS = (MAX_X + MAX_Y) * 0.01  # 1% of the side.
+    CLOSE_DISTANCE_RADIUS = MAX_FIELD_SIDE * 0.01  # 1% of a side.
+
+    # Number of quadrants to which the field should be split. Counted in one axis split.
+    AXIS_QUADRANTS = int(
+        math.sqrt(
+            float(NODES)/(TRANSACTIONS_P2P_UNIQUE+TRANSACTIONS_P2B_UNIQUE)
+        )
+    ) + 1   # +1 is an extra quadrant for the values at the edge.
+    AXIS_QUADRANT_SIDE = float(MAX_FIELD_SIDE) / AXIS_QUADRANTS
 
     def __init__(self, debug=False):
 
         self.DEBUG = debug
 
         # {node id} -> (x, y)
-        # Coordinates are saved in float
+        # Coordinates are saved in float.
         self.nodes_loc = {}
+
+        # Quadrants are defined by a tuple key (x, y)
+        # Defines which quadrant does the node belong to.
+        # Deleted after payees generation.
+        self.nodes_to_quadrant = {}
+        # Defines which nodes belong to a quadrant.
+        self.quadrants_to_nodes = defaultdict(list)
 
         # Next bill ID counter.
         self.next_bill_id = 0
@@ -103,6 +121,10 @@ class Simulator:
             # nodes_buckets = np.array_split(range(self.NODES), self.PROCESSES)
             with Pool(self.PROCESSES) as pool:
                 payees = pool.map(self.generate_node_payees, range(self.NODES))
+
+            # Free up memory from non-needed variables.
+            del self.quadrants_to_nodes
+            del self.nodes_to_quadrant
 
             for i in range(self.NODES):
                 self.b_receivers[i] = payees[i][0]
@@ -386,8 +408,13 @@ class Simulator:
             # Empty wallets are created by default.
 
             # Set location.
-            loc = (float(random.randrange(self.MAX_X)), float(random.randrange(self.MAX_Y)))
+            loc = (float(random.randrange(self.MAX_FIELD_SIDE)), float(random.randrange(self.MAX_FIELD_SIDE)))
             self.nodes_loc[i] = loc
+
+            # Set quadrants.
+            quadrant = (int(loc[0]/self.AXIS_QUADRANT_SIDE), int(loc[1]/self.AXIS_QUADRANT_SIDE))
+            self.nodes_to_quadrant[i] = quadrant
+            self.quadrants_to_nodes[quadrant].append(i)
 
             # Pick if the node is a business.
             if random.randrange(100) <= 100 * self.BUSINESSES_PERCENT:
@@ -397,7 +424,9 @@ class Simulator:
 
         # Set defaults for randomized businesses and non businesses.
         self.randomized_businesses = list(self.businesses)
+        random.shuffle(self.randomized_businesses)
         self.randomized_non_businesses = list(self.non_businesses)
+        random.shuffle(self.randomized_non_businesses)
 
     def generate_node_payees(self, node_id):
         """
@@ -405,6 +434,9 @@ class Simulator:
         :param node_id: Which node to generate payees for.
         :return: (list of business payees, list of private payees)
         """
+
+        # Get node's quadrant.
+        node_quadrant_x, node_quadrant_y = self.nodes_to_quadrant[node_id]
 
         # Create empty lists of receivers.
         self.p_receivers[node_id] = set()
@@ -420,39 +452,80 @@ class Simulator:
 
         close_businesses = set()
         far_businesses = set()
-        random.shuffle(self.randomized_businesses)
-        for j in range(len(self.businesses)):
-            k = self.randomized_businesses[j]  # Random business ID.
+        close_friends = set()
+        far_friends = set()
 
-            # If the business is close and we need one, we save it for i node.
+        # Generate random far businesses.
+        while len(far_businesses) < n_far_businesses:
+            # Pick a random business ID.
+            k = self.randomized_businesses[random.randrange(len(self.randomized_businesses))]
+
+            # If the business is close, and we need one, we save it.
             if self.close_dist(self.distance_between_nodes(node_id, k)):
                 if len(close_businesses) < n_close_businesses:
                     close_businesses.add(k)
-            # If the business is far and we need it, we save it for i node.
+            # If the business is far, we save it.
+            # No need to check if we already have enough far businesses, it's checked by the main loop.
             else:
-                if len(far_businesses) < n_far_businesses:
-                    far_businesses.add(k)
+                far_businesses.add(k)
 
-            if len(close_businesses) >= n_close_businesses and len(far_businesses) >= n_far_businesses:
-                break
+        # Generate random far friends.
+        while len(far_friends) < n_far_friends:
+            # Pick a random friend ID.
+            k = self.randomized_non_businesses[random.randrange(len(self.randomized_non_businesses))]
 
-        close_friends = set()
-        far_friends = set()
-        random.shuffle(self.randomized_non_businesses)
-        for j in range(len(self.non_businesses)):
-            k = self.randomized_non_businesses[j]  # Random friend ID.
-
-            # If the business is close and we need one, we save it for i node.
+            # If the business is close, and we need one, we save it.
             if self.close_dist(self.distance_between_nodes(node_id, k)):
                 if len(close_friends) < n_close_friends:
                     close_friends.add(k)
-            # If the business is far and we need it, we save it for i node.
+            # If the friend is far, we save it.
+            # No need to check if we already have enough far friends, it's checked by the main loop.
             else:
-                if len(far_friends) < n_far_friends:
-                    far_friends.add(k)
+                far_friends.add(k)
 
-            if len(close_friends) >= n_close_friends and len(far_friends) >= n_far_friends:
-                break
+        # Generate random close businesses and friends.
+        if len(close_businesses) < n_close_businesses or len(close_friends) < n_close_friends:
+            # Close businesses are picked out of neighboring quadrants only.
+            # No need to worry about uniqueness, nodes only belong to one quadrant.
+            close_nodes_candidates = []
+            # Add nodes from neighboring quadrants.
+            # Because quadrants_to_nodes is a default list, it just adds empty lists for non-existent quadrants.
+            close_nodes_candidates += self.quadrants_to_nodes[(node_quadrant_x-1, node_quadrant_y-1)]
+            close_nodes_candidates += self.quadrants_to_nodes[(node_quadrant_x-1, node_quadrant_y)]
+            close_nodes_candidates += self.quadrants_to_nodes[(node_quadrant_x-1, node_quadrant_y+1)]
+            close_nodes_candidates += self.quadrants_to_nodes[(node_quadrant_x, node_quadrant_y-1)]
+            close_nodes_candidates += self.quadrants_to_nodes[(node_quadrant_x, node_quadrant_y)]
+            close_nodes_candidates += self.quadrants_to_nodes[(node_quadrant_x, node_quadrant_y+1)]
+            close_nodes_candidates += self.quadrants_to_nodes[(node_quadrant_x+1, node_quadrant_y-1)]
+            close_nodes_candidates += self.quadrants_to_nodes[(node_quadrant_x+1, node_quadrant_y)]
+            close_nodes_candidates += self.quadrants_to_nodes[(node_quadrant_x+1, node_quadrant_y+1)]
+            # Shuffle the results.
+            random.shuffle(close_nodes_candidates)
+
+            # Walk through each node ID.
+            for k in close_nodes_candidates:
+                # Exit if we have enough close businesses and friends.
+                if len(close_businesses) >= n_close_businesses and len(close_friends) >= n_close_friends:
+                    break
+
+                # If the node is far, we don't need it.
+                if self.close_dist(self.distance_between_nodes(node_id, k)):
+                    continue
+
+                # Check if the node is a business or a consumer.
+                if k in self.businesses:
+                    # If we still need close businesses.
+                    if len(close_businesses) < n_close_businesses:
+                        close_businesses.add(k)
+                # If the node is a consumer, and we need one.
+                elif len(close_friends) < n_close_friends:
+                    close_friends.add(k)
+
+            # Free up memory.
+            del close_nodes_candidates
+
+            # There are theoretically might not be enough close businesses or friends at this point,
+            # but it means that they don't exist.
 
         return(
             # We mix close and far businesses up because the payments send rate is uniform.
