@@ -1,6 +1,7 @@
 from collections import defaultdict
 from multiprocessing import Pool
 import math
+from os.path import exists
 from sys import getsizeof
 import random
 import numpy as np
@@ -16,9 +17,11 @@ log = logging.getLogger(__name__)
 
 class Simulator:
 
+    OUTPUT_FILE_NAME = "fragmentation_output"   # .csv extension is added automatically.
+
     PROCESSES = 7
 
-    CLUSTERS = 16 * 256  # *256
+    CLUSTERS = 16 * 16  # *256
     NODES_PER_CLUSTER = 16
     NODES = CLUSTERS * NODES_PER_CLUSTER
     BUSINESSES_PERCENT = 0.05  # float % from 0 to 1
@@ -109,6 +112,14 @@ class Simulator:
         # {node_id} -> [person_id (node), person_id, person_id, ...]
         self.p_receivers = {}
 
+        # Make an output file.
+        self.output_path = "./{}.csv".format(self.OUTPUT_FILE_NAME)
+        if exists(self.output_path):
+            i = 1
+            while exists("./{}_{}.csv".format(self.OUTPUT_FILE_NAME, i)):
+                i += 1
+            self.output_path = "./{}_{}.csv".format(self.OUTPUT_FILE_NAME, i)
+
         with Timer('Generate nodes'):
             self.generate_nodes()
 
@@ -136,10 +147,12 @@ class Simulator:
     def run(self, transactions: int = 1000):
         global log
 
+        self.system_status_bills_title()
+
         for i in range(transactions):
             with Timer("Transactions run #{}".format(i)):
                 self.transactions_run()
-                # self.system_status_bills()
+                self.system_status_bills(str(i))
 
     @classmethod
     def run_transactions_thread(cls, args: tuple) -> (dict, dict):
@@ -340,25 +353,50 @@ class Simulator:
     def system_status(self):
         global log
 
-        log.info("---------System Status---------")
-        log.info("{} nodes.".format(len(self.nodes_loc)))
-        log.info("Mean friends per person: {}".format(mean([len(self.p_receivers[i]) for i in range(self.NODES)])))
-        log.info("Mean businesses per person: {}".format(mean([len(self.b_receivers[i]) for i in range(self.NODES)])))
-
+        output = "---------System Status---------" \
+                 "\n{} nodes.".format(len(self.nodes_loc))
+        output += "\nMean friends per person: {}".format(mean([len(self.p_receivers[i]) for i in range(self.NODES)]))
+        output += "\nMean businesses per person: {}".format(mean([len(self.b_receivers[i]) for i in range(self.NODES)]))
+        output += "\nMean businesses per person: {}".format(mean([len(self.b_receivers[i]) for i in range(self.NODES)]))
         totals = [self.bills_size[x] for x in self.bills_size.keys()]
-        log.info("{}$ in the system.".format(sum(totals)/100))
-        log.info("Mean bill size ${}".format(mean(totals)/100))
-        log.info("Total bills: {}".format(len(self.bills_size.keys())))
-        log.info("Avg bills per person: {}".format(len(self.bills_size.keys())/self.NODES))
-
+        output += "\n{}$ in the system.".format(sum(totals)/100)
+        output += "\nMean bill size ${}".format(mean(totals)/100)
+        output += "\nTotal bills: {}".format(len(self.bills_size.keys()))
+        output += "\nAvg bills per person: {}".format(float(len(self.bills_size.keys()))/self.NODES)
         wealth = [sum([self.bills_size[x] for x in self.wallets[i]]) for i in range(self.NODES)]
-        log.info("Mean wealth per person ${}".format(mean(wealth)/100))
-        log.info("Max wealth: ${}".format(max(wealth)/100))
-        log.info("Min wealth: ${}".format(min(wealth)/100))
-        log.info("-------------------------------")
+        output += "\nMean wealth per person ${}".format(mean(wealth)/100)
+        output += "\nMax wealth: ${}".format(max(wealth)/100)
+        output += "\nMin wealth: ${}".format(min(wealth)/100)
+        output += "\n-------------------------------"
+        output += "\n"
 
-    def system_status_bills(self):
-        log.info("Total bills: {}".format(len(self.bills_size.keys())))
+        log.info(output)
+        with open(self.output_path, "a") as fp:
+            fp.write(output)
+
+    def system_status_bills_title(self):
+        with open(self.output_path, "a") as fp:
+            fp.write(
+                "#\tTotal Bills\tAvg Bill Count Per Person\tMean Bill Size\n"
+            )
+
+    def system_status_bills(self, transaction_number=""):
+        total_bills = len(self.bills_size.keys())
+        totals = [self.bills_size[x] for x in self.bills_size.keys()]
+        mean_bill_size = mean(totals)/100
+        avg_bills_per_person = float(total_bills)/self.NODES
+
+        log.info("Total bills: {}".format(total_bills))
+
+        with open(self.output_path, "a") as fp:
+            fp.write(
+                "{}\t{}\t{}\t{}\n".format(
+                    transaction_number,
+                    total_bills,
+                    avg_bills_per_person,
+                    mean_bill_size,
+                )
+            )
 
     def close_dist(self, distance):
         """Returns True if the distance is close."""
