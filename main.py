@@ -1,3 +1,5 @@
+import os.path
+import pathlib
 from collections import defaultdict
 from multiprocessing import Pool
 import math
@@ -5,6 +7,7 @@ from os.path import exists
 from sys import getsizeof
 import random
 import numpy as np
+import matplotlib.pyplot as plt
 from timer_cm import Timer
 from scipy.stats import truncnorm
 from statistics import mean
@@ -17,9 +20,13 @@ log = logging.getLogger(__name__)
 
 class Simulator:
 
-    OUTPUT_FILE_NAME = "fragmentation_output"   # .csv extension is added automatically.
+    OUTPUT_FOLDER = 'out'
 
+    # Number of free cores on your CPU.
     PROCESSES = 7
+
+    # Default nu,ber of transactions to run.
+    TRANSACTIONS = 10
 
     CLUSTERS = 16 * 16  # *256
     NODES_PER_CLUSTER = 16
@@ -65,6 +72,28 @@ class Simulator:
     def __init__(self, debug=False):
 
         self.DEBUG = debug
+
+        # Dict for current overall statistics.
+        self.stats = {
+            'nodes_total': None,
+            'friends_per_person_mean': None,
+            'businesses_per_person_mean': None,
+            'money_in_system_total': None,  # In $, not cents.
+            'bill_size_mean': None,
+            'bills_count_total': None,
+            'bills_per_person_avg': None,
+            'wealth_max': None,
+            'wealth_min': None,
+            'wealth_mean': None,
+            'bills_used_avg': None,
+            'transaction_volume_avg': None,
+            'wallets_size_mb': None,
+            'bills_size_size_mb': None,
+            'bills_cluster_size_mb': None,
+            'b_receivers_size_mb': None,
+            'p_receivers_size_mb': None,
+            'generation': 0,
+        }
 
         # {node id} -> (x, y)
         # Coordinates are saved in float.
@@ -112,13 +141,13 @@ class Simulator:
         # {node_id} -> [person_id (node), person_id, person_id, ...]
         self.p_receivers = {}
 
-        # Make an output file.
-        self.output_path = "./{}.csv".format(self.OUTPUT_FILE_NAME)
-        if exists(self.output_path):
-            i = 1
-            while exists("./{}_{}.csv".format(self.OUTPUT_FILE_NAME, i)):
-                i += 1
-            self.output_path = "./{}_{}.csv".format(self.OUTPUT_FILE_NAME, i)
+        # Make an output folder.
+        current_path = pathlib.Path().resolve()
+        run_number = 1
+        while exists(os.path.join(current_path, self.OUTPUT_FOLDER, "run_{}".format(run_number))):
+            run_number += 1
+        self.output_path = os.path.join(current_path, self.OUTPUT_FOLDER, "run_{}".format(run_number))
+        os.mkdir(self.output_path)
 
         with Timer('Generate nodes'):
             self.generate_nodes()
@@ -144,15 +173,19 @@ class Simulator:
         with Timer('Generate bills'):
             self.generate_bills()
 
-    def run(self, transactions: int = 1000):
+    def run(self, transactions: int = 0):
         global log
+
+        if not transactions:
+            transactions = self.TRANSACTIONS
 
         self.system_status_bills_title()
 
         for i in range(transactions):
             with Timer("Transactions run #{}".format(i)):
+                self.stats['generation'] = i
                 self.transactions_run()
-                self.system_status_bills(str(i))
+                self.system_status_bills()
 
     @classmethod
     def run_transactions_thread(cls, args: tuple) -> (dict, dict):
@@ -164,23 +197,44 @@ class Simulator:
         :param bills_size: Dict of bills sizes from self.bills_size with bill_id as a key.
         :param bills_cluster: Dict of bills clusters from self.bills_cluster with bill_id as a key.
         :param free_bill_ids: List of free bill ids to use.
-        :return: (wallets, bills_size, bills_cluster, free_bill_ids) <- New wallets, bills_size, bills_cluster, and free_bill_ids after the transaction.
+        :return: (
+            wallets,                # New wallets
+            bills_size,
+            bills_cluster,
+            free_bill_ids,          # Free_bill_ids after the transaction
+            bills_used_total,         # Total number of bills used in each transaction
+            transaction_volume_total, # Total amount of each transaction
+        )
         """
+
         global log
         transactions_map, wallets, bills_size, bills_cluster, free_bill_ids = args
 
         if len(set(free_bill_ids)) != len(free_bill_ids):
             raise Exception('Duplicate in free_bill_ids #1')
 
+        # Vars to keep track of stats.
+        bills_used_total = 0
+        transaction_volume_total = 0
+
         for from_node_id, to_node_id in transactions_map:
             # Get balance.
             amount = int(cls.get_balance_static(from_node_id, wallets, bills_size) * random.uniform(0.01, 1.0) ** 2)
+            transaction_volume_total += amount
 
             if len(set(free_bill_ids)) != len(free_bill_ids):
                 raise Exception('Duplicate in free_bill_ids #2')
 
             # Perform the transaction.
-            cls.send_amount(from_node_id, to_node_id, amount, wallets, bills_size, bills_cluster, free_bill_ids)
+            bills_used_total += cls.send_amount(
+                from_node_id,
+                to_node_id,
+                amount,
+                wallets,
+                bills_size,
+                bills_cluster,
+                free_bill_ids,
+            )
 
             if len(set(free_bill_ids)) != len(free_bill_ids):
                 raise Exception('Duplicate in free_bill_ids #3')
@@ -191,7 +245,8 @@ class Simulator:
             if len(set(free_bill_ids)) != len(free_bill_ids):
                 raise Exception('Duplicate in free_bill_ids #4')
 
-        return wallets, bills_size, bills_cluster, free_bill_ids
+
+        return wallets, bills_size, bills_cluster, free_bill_ids, bills_used_total, transaction_volume_total
 
     def transactions_run(self):
         """Run a random set of transaction on the existing nodes in parallel."""
@@ -290,11 +345,11 @@ class Simulator:
         for i in range(self.PROCESSES):
             parallel_args.append(
                 (
-                    transactions_buckets[i],
-                    wallets_split[i],
-                    bills_size_split[i],
-                    bills_cluster_split[i],
-                    free_bill_ids_buckets[i]
+                    transactions_buckets[i],    # [0] - Map of transactions to perform.
+                    wallets_split[i],           # [1] - Participating wallets.
+                    bills_size_split[i],        # [2] - Participating bills' sizes.
+                    bills_cluster_split[i],     # [3] - Participating bills' clusters.
+                    free_bill_ids_buckets[i]    # [4] - List of free bill IDs for new bill creation.
                 )
             )
         # Run transactions. Choose the method below and comment one out.
@@ -310,6 +365,12 @@ class Simulator:
 
         # Merge the data back to the main pull.
         # Re-save the bills of the nodes that did not participate in this run.
+        # parallel_res[bucket_id][0] <- New wallets
+        # parallel_res[bucket_id][1] <- bills_size
+        # parallel_res[bucket_id][2] <- bills_cluster
+        # parallel_res[bucket_id][3] <- Free_bill_ids after the transaction
+        # parallel_res[bucket_id][4] <- Average number of bills used in each transaction
+        # parallel_res[bucket_id][5] <- Average amount of each transaction
         new_bills_size = {}
         new_bills_cluster = {}
         not_participating_nodes = set([x for x in range(self.NODES)]) - set(node_to_bucket.keys())
@@ -318,6 +379,7 @@ class Simulator:
                 new_bills_size[bill_id] = self.bills_size[bill_id]
                 new_bills_cluster[bill_id] = self.bills_cluster[bill_id]
 
+        # Iterate over each node and collect data.
         for node_id, bucket_id in node_to_bucket.items():
             # Update the wallets.
             self.wallets[node_id] = parallel_res[bucket_id][0][node_id]     # [0] is wallets
@@ -330,12 +392,26 @@ class Simulator:
                 new_bills_size[bill_id] = parallel_res[bucket_id][1][bill_id]    # [1] is bills_size
                 new_bills_cluster[bill_id] = parallel_res[bucket_id][2][bill_id]    # [2] is bills_cluster
 
-        # Save free bill_ids back into the main bucket.
+        # Vars for stats calculation.
+        bills_used_total = 0
+        transaction_volume_total = 0
+
+        # Iterate over each process and update data.
         for bucket_id in range(self.PROCESSES):
+            # Save free bill_ids back into the main bucket.
             self.free_bill_ids += parallel_res[bucket_id][3]    # [3] is free_bill_ids
 
+            # Update stats.
+            bills_used_total += parallel_res[bucket_id][4]    # [4] - Total number of bills used in all transactions.
+            transaction_volume_total += parallel_res[bucket_id][5]    # [5] - Total amount of all transactions.
+
+        # Finish up stats calculations.
+        total_transactions = sum([len(parallel_args[x][0]) for x in range(self.PROCESSES)])
+        self.stats['bills_used_avg'] = float(bills_used_total) / total_transactions
+        self.stats['transaction_volume_avg'] = float(transaction_volume_total) / total_transactions
+
         if len(set(self.free_bill_ids)) != len(self.free_bill_ids):
-            raise Exception('Duplicate in free_bill_ids #d')
+            raise Exception('Duplicate in free_bill_ids after performing a full transaction run.')
 
         # Flush bills into the common pull.
         self.bills_size = new_bills_size
@@ -350,51 +426,122 @@ class Simulator:
             # Transaction to a business.
             return random.choice(list(self.b_receivers[node_id]))
 
-    def system_status(self):
-        global log
+    def update_system_status(self):
+        """Updates self.stats with the latest data."""
 
-        output = "---------System Status---------" \
-                 "\n{} nodes.".format(len(self.nodes_loc))
-        output += "\nMean friends per person: {}".format(mean([len(self.p_receivers[i]) for i in range(self.NODES)]))
-        output += "\nMean businesses per person: {}".format(mean([len(self.b_receivers[i]) for i in range(self.NODES)]))
-        output += "\nMean businesses per person: {}".format(mean([len(self.b_receivers[i]) for i in range(self.NODES)]))
+        self.stats['nodes_total'] = len(self.nodes_loc)
+        self.stats['friends_per_person_mean'] = mean([len(self.p_receivers[i]) for i in range(self.NODES)])
+        self.stats['businesses_per_person_mean'] = mean([len(self.b_receivers[i]) for i in range(self.NODES)])
+
         totals = [self.bills_size[x] for x in self.bills_size.keys()]
-        output += "\n{}$ in the system.".format(sum(totals)/100)
-        output += "\nMean bill size ${}".format(mean(totals)/100)
-        output += "\nTotal bills: {}".format(len(self.bills_size.keys()))
-        output += "\nAvg bills per person: {}".format(float(len(self.bills_size.keys()))/self.NODES)
+        self.stats['money_in_system_total'] = sum(totals)/100
+        self.stats['bill_size_mean'] = mean(totals)/100
+        self.stats['bills_count_total'] = len(self.bills_size.keys())
+        self.stats['bills_per_person_avg'] = float(len(self.bills_size.keys()))/self.NODES
+
         wealth = [sum([self.bills_size[x] for x in self.wallets[i]]) for i in range(self.NODES)]
-        output += "\nMean wealth per person ${}".format(mean(wealth)/100)
-        output += "\nMax wealth: ${}".format(max(wealth)/100)
-        output += "\nMin wealth: ${}".format(min(wealth)/100)
-        output += "\n-------------------------------"
-        output += "\n"
+        self.stats['wealth_max'] = max(wealth)/100
+        self.stats['wealth_min'] = min(wealth)/100
+        self.stats['wealth_mean'] = mean(wealth)/100
 
-        log.info(output)
-        with open(self.output_path, "a") as fp:
-            fp.write(output)
+        self.stats['wallets_size_mb'] = getsizeof(simulator.wallets) / 1000000
+        self.stats['bills_size_size_mb'] = getsizeof(simulator.bills_size) / 1000000
+        self.stats['bills_cluster_size_mb'] = getsizeof(simulator.bills_cluster) / 1000000
+        self.stats['b_receivers_size_mb'] = getsizeof(simulator.b_receivers) / 1000000
+        self.stats['p_receivers_size_mb'] = getsizeof(simulator.p_receivers) / 1000000
 
-    def system_status_bills_title(self):
-        with open(self.output_path, "a") as fp:
-            fp.write(
-                "#\tTotal Bills\tAvg Bill Count Per Person\tMean Bill Size\n"
+    def output_system_status(self, into_log=True, into_file=True):
+        """
+        Write out current system status.
+        :param into_log: (True) Output into the log.
+        :param into_file: (True) Output into the file.
+        :return:
+        """
+        if not into_log and not into_file:
+            return
+
+        self.update_system_status()
+
+        # Prepare a wealth graph.
+        plt.hist([sum([self.bills_size[x] for x in self.wallets[i]]) / 100 for i in range(self.NODES)], bins=1000)
+        plt.xlim([0, self.NET_WORTH_AVG / 100 * 4])
+        plt.xlabel("$ per person")
+        plt.ylabel("# of ppl with this wealth")
+
+        if into_file:
+            with open(os.path.join(self.output_path, 'system_status.tsv'), "a") as fp:
+                output = "---SYSTEM STATUS on Gen. {}---\n".format(self.stats['generation'])
+                output += "Total nodes:\t{}\n".format(self.stats['nodes_total'])
+                output += "Total $ in the system:\t{}\n".format(self.stats['money_in_system_total'])
+                output += "Total # of bills:\t{}\n".format(self.stats['bills_count_total'])
+                output += "Mean bill size:\t{}\n".format(self.stats['bill_size_mean'])
+                output += "Avg # of bills per person:\t{}\n".format(self.stats['bills_per_person_avg'])
+                output += "Mean wealth per person:\t{}\n".format(self.stats['wealth_mean'])
+                output += "Max wealth per person:\t{}\n".format(self.stats['wealth_max'])
+                output += "Min wealth per person:\t{}\n".format(self.stats['wealth_min'])
+                output += "Mean friends per person:\t{}\n".format(self.stats['friends_per_person_mean'])
+                output += "Mean businesses per person:\t{}\n".format(self.stats['businesses_per_person_mean'])
+                output += "Wallets storage size (MB):\t{}\n".format(self.stats['wallets_size_mb'])
+                output += "Bills storage size (MB):\t{}\n".format(self.stats['bills_size_size_mb'])
+                output += "Bills cluster storage size (MB):\t{}\n".format(self.stats['bills_cluster_size_mb'])
+                output += "Business receivers storage size (MB):\t{}\n".format(self.stats['b_receivers_size_mb'])
+                output += "Personal receivers storage size (MB):\t{}\n".format(self.stats['p_receivers_size_mb'])
+                output += "\n"
+                fp.write(output)
+
+            plt.savefig(
+                os.path.join(self.output_path, "wealth_spread_gen_{}.png".format(self.stats['generation'])),
+                bbox_inches='tight',
             )
 
-    def system_status_bills(self, transaction_number=""):
-        total_bills = len(self.bills_size.keys())
-        totals = [self.bills_size[x] for x in self.bills_size.keys()]
-        mean_bill_size = mean(totals)/100
-        avg_bills_per_person = float(total_bills)/self.NODES
+        if into_log:
+            global log
 
-        log.info("Total bills: {}".format(total_bills))
+            log.info("---------System Status on Gen. {}---------".format(self.stats['generation']))
+            log.info("Total nodes: {}".format(self.stats['nodes_total']))
+            log.info("Total $ in the system: {}".format(self.stats['money_in_system_total']))
+            log.info("Total # of bills: {}".format(self.stats['bills_count_total']))
+            log.info("Mean bill size: {}".format(self.stats['bill_size_mean']))
+            log.info("Avg # of bills per person: {}".format(self.stats['bills_per_person_avg']))
+            log.info("Mean wealth per person: {}".format(self.stats['wealth_mean']))
+            log.info("Max wealth per person: {}".format(self.stats['wealth_max']))
+            log.info("Min wealth per person: {}".format(self.stats['wealth_min']))
+            log.info("Mean friends per person: {}".format(self.stats['friends_per_person_mean']))
+            log.info("Mean businesses per person: {}".format(self.stats['businesses_per_person_mean']))
+            log.info("Wallets storage size: {} MB".format(self.stats['wallets_size_mb']))
+            log.info("Bills storage size: {} MB".format(self.stats['bills_size_size_mb']))
+            log.info("Bills cluster storage size: {} MB".format(self.stats['bills_cluster_size_mb']))
+            log.info("Business receivers storage size: {} MB".format(self.stats['b_receivers_size_mb']))
+            log.info("Personal receivers storage size: {} MB".format(self.stats['p_receivers_size_mb']))
 
-        with open(self.output_path, "a") as fp:
+            plt.show()
+
+        plt.clf()
+
+    def system_status_bills_title(self):
+        with open(os.path.join(self.output_path, 'transactions_log.tsv'), "a") as fp:
             fp.write(
-                "{}\t{}\t{}\t{}\n".format(
-                    transaction_number,
-                    total_bills,
-                    avg_bills_per_person,
-                    mean_bill_size,
+                "Transaction Generations"
+                "\tTotal bills"
+                "\tAvg bill count per person"
+                "\tMean bill size"
+                "\tAvg number of bills used per transaction"
+                "\tAvg transaction volume"
+                "\n"
+            )
+
+    def system_status_bills(self):
+        self.update_system_status()
+
+        with open(os.path.join(self.output_path, 'transactions_log.tsv'), "a") as fp:
+            fp.write(
+                "{}\t{}\t{}\t{}\t{}\t{}\n".format(
+                    self.stats['generation'],
+                    self.stats['bills_count_total'],
+                    self.stats['bills_per_person_avg'],
+                    self.stats['bill_size_mean'],
+                    self.stats['bills_used_avg'],
+                    self.stats['transaction_volume_avg'],
                 )
             )
 
@@ -671,7 +818,7 @@ class Simulator:
         :param bills_size: Gets updated by a reference.
         :param bills_cluster: Gets updated by a reference.
         :param free_bill_ids: List of free_bill_ids that can be used to split the bills.
-        :return: True - Amount sent. False - balance is too low.
+        :return: Number of bills that participated in this transaction.
         """
         # We assume that the balance is correct, so we do not need to check it.
         # if check_balance:
@@ -693,11 +840,13 @@ class Simulator:
             reverse=True,   # So we can pop the bills from the end.
         )
 
+        bills_used = 0  # Number of bills that participated in this transaction.
         amount_left_to_send = amount
         # Sending until we run out of the needed amount or bills.
         while amount_left_to_send and len(wallets[from_node_id]):
             # Take the bill that we are operating with.
             bill_id = wallets[from_node_id].pop()
+            bills_used += 1
 
             # If the bill is not enough to cover the transaction, we send the whole bill.
             if bills_size[bill_id] <= amount_left_to_send:
@@ -721,6 +870,8 @@ class Simulator:
                 wallets[to_node_id].append(new_bill_id)
 
                 amount_left_to_send = 0
+
+        return bills_used
 
     @staticmethod
     def check_wallet(wallets, bills, owner_id, msg=""):
@@ -880,8 +1031,8 @@ class Simulator:
 
 
 if __name__ == '__main__':
-    simulator = Simulator(debug=True)
-    simulator.system_status()
+    simulator = Simulator(debug=False)
+    simulator.output_system_status()
 
     print("Wallets size: {} MB, Bills_size size: {} MB, Bills_cluster size: {} MB, Business receivers: {} MB, Private receivers: {} MB".format(
         getsizeof(simulator.wallets)/1000000,
@@ -890,6 +1041,6 @@ if __name__ == '__main__':
         getsizeof(simulator.b_receivers)/1000000,
         getsizeof(simulator.p_receivers)/1000000,
     ))
-    simulator.run(10)
-    simulator.system_status()
+    simulator.run()
+    simulator.output_system_status()
 
