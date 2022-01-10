@@ -1032,7 +1032,7 @@ class Simulator:
 
 if __name__ == '__main__':
     simulator = Simulator(debug=False)
-    simulator.output_system_status()
+    simulator.output_system_status(into_log=False)
 
     print("Wallets size: {} MB, Bills_size size: {} MB, Bills_cluster size: {} MB, Business receivers: {} MB, Private receivers: {} MB".format(
         getsizeof(simulator.wallets)/1000000,
@@ -1042,5 +1042,5 @@ if __name__ == '__main__':
         getsizeof(simulator.p_receivers)/1000000,
     ))
     simulator.run()
-    simulator.output_system_status()
+    simulator.output_system_status(into_log=False)
 
