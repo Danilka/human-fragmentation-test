@@ -1,3 +1,4 @@
+import copy
 import os.path
 import pathlib
 from collections import defaultdict
@@ -34,7 +35,6 @@ class Simulator:
     BUSINESSES_PERCENT = 0.05  # float % from 0 to 1
 
     TRANSACTIONS_P2P_PERCENT = 0.2  # float % from 0 to 1
-    TRANSACTIONS_P2B_PERCENT = 0.8  # float % from 0 to 1
 
     # Regulated by the total number of transaction runs at the moment.
     TRANSACTIONS_P2P_UNIQUE = 50  # Number of people that any person interacts with
@@ -42,6 +42,8 @@ class Simulator:
     # TRANSACTIONS_PER_PERSON_AVG = 1000  # Per year
     # TRANSACTIONS_PER_PERSON_MIN = 500   # Per year
     # TRANSACTIONS_PER_PERSON_MAX = 5000  # Per year
+    PAYROLL_FREQUENCY = 9   # Every Nth transaction payroll will be paid.
+    PAYROLL_VOLUME = 1.0     # Percentage of cash spent on payroll each pay period. [0, 1]
 
     TRANSACTION_SIZE_MIN = 0.001  # float % from net worth [0; 1]
     TRANSACTION_SIZE_MAX = 0.1  # float % from net worth [0; 1]
@@ -76,6 +78,8 @@ class Simulator:
         # Dict for current overall statistics.
         self.stats = {
             'nodes_total': None,
+            'private_people_count': None,
+            'businesses_count': None,
             'friends_per_person_mean': None,
             'businesses_per_person_mean': None,
             'money_in_system_total': None,  # In $, not cents.
@@ -141,6 +145,14 @@ class Simulator:
         # {node_id} -> [person_id (node), person_id, person_id, ...]
         self.p_receivers = {}
 
+        # Employees.
+        # {business_id} -> [employee_id, employee_id, ...]
+        self.employees = defaultdict(set)
+        #
+        # # Employee counters.
+        # # {business_id} -> number_of_employees
+        # self.employee_counters = defaultdict(lambda _: 0)   # Default is 0 employees
+
         # Make an output folder.
         current_path = pathlib.Path().resolve()
         run_number = 1
@@ -161,6 +173,9 @@ class Simulator:
             # nodes_buckets = np.array_split(range(self.NODES), self.PROCESSES)
             with Pool(self.PROCESSES) as pool:
                 payees = pool.map(self.generate_node_payees, range(self.NODES))
+                # payees[i][0] - business receivers for node i
+                # payees[i][1] - private receivers for node i
+                # payees[i][2] - employer id for node i
 
             # Free up memory from non-needed variables.
             del self.quadrants_to_nodes
@@ -169,6 +184,7 @@ class Simulator:
             for i in range(self.NODES):
                 self.b_receivers[i] = payees[i][0]
                 self.p_receivers[i] = payees[i][1]
+                self.employees[payees[i][2]].add(payees[i][2])
 
         with Timer('Generate bills'):
             self.generate_bills()
@@ -184,7 +200,14 @@ class Simulator:
         for i in range(transactions):
             with Timer("Transactions run #{}".format(i)):
                 self.stats['generation'] = i
-                self.transactions_run()
+
+                # Decide if this is a payroll run or just regular transactions.
+                if i and i % self.PAYROLL_FREQUENCY == 0:
+                    payroll = True
+                else:
+                    payroll = False
+
+                self.transactions_run(payroll)
                 self.system_status_bills()
 
     @classmethod
@@ -192,7 +215,7 @@ class Simulator:
         """
         Run transactions from the transactions_map using passed data.
         All the following params are passed as one tuple to simplify multiprocessing.
-        :param transactions_map: List of tuples tu run transactions (from_node_id, to_node_id)
+        :param transactions_map: List of tuples tu run transactions (from_node_id, to_node_id, amount(or None))
         :param wallets: Dict of wallets with node_id as a key.
         :param bills_size: Dict of bills sizes from self.bills_size with bill_id as a key.
         :param bills_cluster: Dict of bills clusters from self.bills_cluster with bill_id as a key.
@@ -217,9 +240,10 @@ class Simulator:
         bills_used_total = 0
         transaction_volume_total = 0
 
-        for from_node_id, to_node_id in transactions_map:
+        for from_node_id, to_node_id, amount in transactions_map:
             # Get balance.
-            amount = int(cls.get_balance_static(from_node_id, wallets, bills_size) * random.uniform(0.01, 1.0) ** 2)
+            if not amount:
+                amount = int(cls.get_balance_static(from_node_id, wallets, bills_size) * random.uniform(0.01, 1.0) ** 2)
             transaction_volume_total += amount
 
             if len(set(free_bill_ids)) != len(free_bill_ids):
@@ -248,17 +272,8 @@ class Simulator:
 
         return wallets, bills_size, bills_cluster, free_bill_ids, bills_used_total, transaction_volume_total
 
-    def transactions_run(self):
+    def transactions_run(self, payroll: bool = False):
         """Run a random set of transaction on the existing nodes in parallel."""
-
-        # Pick the nodes for the transaction.
-        # TODO: This is too uniform. You can switch it to a more sporadic approach.
-        from_nodes = [x for x in range(self.NODES)]
-        random.shuffle(from_nodes)
-
-        # Generate recipients.
-        # from_node_id = random.randrange(self.NODES)
-        to_nodes = [self.pick_recipient(x) for x in from_nodes]
 
         # Prep service vars.
         node_to_bucket = {}
@@ -267,40 +282,74 @@ class Simulator:
         # Node IDs that this bucket would interact with.
         nodes_buckets = [set() for _ in range(self.PROCESSES)]
 
-        for i in range(self.NODES):
-            from_node_id = from_nodes[i]
-            from_node_bucket = node_to_bucket[from_node_id] if from_node_id in node_to_bucket.keys() else None
-            to_node_id = to_nodes[i]
-            to_node_bucket = node_to_bucket[to_node_id] if to_node_id in node_to_bucket.keys() else None
+        # Pick the nodes for the transaction.
+        if payroll:
+            # Only businesses distribute money.
+            from_nodes = list(copy.deepcopy(self.businesses))
+        else:
+            # Everyone sends random transactions.
+            from_nodes = [x for x in range(self.NODES)]
+        random.shuffle(from_nodes)
 
-            if from_node_bucket is None and to_node_bucket is None:
-                from_node_bucket = i % self.PROCESSES
-                to_node_bucket = from_node_bucket
-            elif from_node_bucket and to_node_bucket is None:
-                to_node_bucket = from_node_bucket
-            elif from_node_bucket is None and to_node_bucket:
-                from_node_bucket = to_node_bucket
-            elif from_node_bucket == to_node_bucket:
-                # All the buckets are already assigned properly.
-                pass
-            else:
-                # Nodes are already in different buckets, the transaction is a no-go.
-                continue
+        if payroll:
+            for from_node_id in from_nodes:
+                bucket = from_node_id % self.PROCESSES
 
-            # Save the bucket mapping.
-            node_to_bucket[from_node_id] = from_node_bucket
-            node_to_bucket[to_node_id] = to_node_bucket
+                # Each business spend 80% of cash on salaries.
+                amount = int(self.get_balance(from_node_id) * self.PAYROLL_VOLUME / len(self.employees[from_node_id]))
 
-            # At this point from_node_bucket = to_node_bucket
-            transactions_buckets[from_node_bucket].append(
-                (from_node_id, to_node_id)
-            )
+                for to_node_id in self.employees[from_node_id]:
+                    transactions_buckets[bucket].append(
+                        (
+                            from_node_id,
+                            to_node_id,
+                            amount,
+                        )
+                    )
 
-            # Save the IDs into the mapping.
-            nodes_buckets[from_node_bucket].update([from_node_id, to_node_id])
+                    # Save the bucket mapping.
+                    node_to_bucket[to_node_id] = bucket
+                node_to_bucket[from_node_id] = bucket
+        else:
+            # Generate recipients.
+            # from_node_id = random.randrange(self.NODES)
+            to_nodes = [self.pick_recipient(x) for x in from_nodes]
 
-        if len(set(self.free_bill_ids)) != len(self.free_bill_ids):
-            raise Exception('Duplicate in free_bill_ids #a')
+            for i in range(self.NODES):
+                from_node_id = from_nodes[i]
+                from_node_bucket = node_to_bucket[from_node_id] if from_node_id in node_to_bucket.keys() else None
+                to_node_id = to_nodes[i]
+                to_node_bucket = node_to_bucket[to_node_id] if to_node_id in node_to_bucket.keys() else None
+
+                if from_node_bucket is None and to_node_bucket is None:
+                    from_node_bucket = i % self.PROCESSES
+                    to_node_bucket = from_node_bucket
+                elif from_node_bucket and to_node_bucket is None:
+                    to_node_bucket = from_node_bucket
+                elif from_node_bucket is None and to_node_bucket:
+                    from_node_bucket = to_node_bucket
+                elif from_node_bucket == to_node_bucket:
+                    # All the buckets are already assigned properly.
+                    pass
+                else:
+                    # Nodes are already in different buckets, the transaction is a no-go.
+                    continue
+
+                # Save the bucket mapping.
+                node_to_bucket[from_node_id] = from_node_bucket
+                node_to_bucket[to_node_id] = to_node_bucket
+
+                # At this point from_node_bucket = to_node_bucket
+                transactions_buckets[from_node_bucket].append(
+                    (
+                        from_node_id,
+                        to_node_id,
+                        None,           # Transaction amount is decided by the performing thread
+                    )
+                )
+
+                # Save the IDs into the mapping.
+                nodes_buckets[from_node_bucket].update([from_node_id, to_node_id])
 
         # Prepare free bill_ids for each bucket.
         # At most each thread will need as many IDs as # of transactions.
@@ -433,6 +482,10 @@ class Simulator:
         self.stats['friends_per_person_mean'] = mean([len(self.p_receivers[i]) for i in range(self.NODES)])
         self.stats['businesses_per_person_mean'] = mean([len(self.b_receivers[i]) for i in range(self.NODES)])
 
+        self.stats['private_people_count'] = len(self.non_businesses)
+        self.stats['businesses_count'] = len(self.businesses)
+        self.stats['businesses_no_employees_count'] = len(self.businesses - set(self.employees.keys()))
+
         totals = [self.bills_size[x] for x in self.bills_size.keys()]
         self.stats['money_in_system_total'] = sum(totals)/100
         self.stats['bill_size_mean'] = mean(totals)/100
@@ -462,16 +515,13 @@ class Simulator:
 
         self.update_system_status()
 
-        # Prepare a wealth graph.
-        plt.hist([sum([self.bills_size[x] for x in self.wallets[i]]) / 100 for i in range(self.NODES)], bins=1000)
-        plt.xlim([0, self.NET_WORTH_AVG / 100 * 4])
-        plt.xlabel("$ per person")
-        plt.ylabel("# of ppl with this wealth")
-
         if into_file:
             with open(os.path.join(self.output_path, 'system_status.tsv'), "a") as fp:
                 output = "---SYSTEM STATUS on Gen. {}---\n".format(self.stats['generation'])
                 output += "Total nodes:\t{}\n".format(self.stats['nodes_total'])
+                output += "Total private people count:\t{}\n".format(self.stats['private_people_count'])
+                output += "Total businesses count:\t{}\n".format(self.stats['businesses_count'])
+                output += "Businesses without employees count:\t{}\n".format(self.stats['businesses_no_employees_count'])
                 output += "Total $ in the system:\t{}\n".format(self.stats['money_in_system_total'])
                 output += "Total # of bills:\t{}\n".format(self.stats['bills_count_total'])
                 output += "Mean bill size:\t{}\n".format(self.stats['bill_size_mean'])
@@ -489,16 +539,14 @@ class Simulator:
                 output += "\n"
                 fp.write(output)
 
-            plt.savefig(
-                os.path.join(self.output_path, "wealth_spread_gen_{}.png".format(self.stats['generation'])),
-                bbox_inches='tight',
-            )
-
         if into_log:
             global log
 
             log.info("---------System Status on Gen. {}---------".format(self.stats['generation']))
             log.info("Total nodes: {}".format(self.stats['nodes_total']))
+            log.info("Total private people count: {}".format(self.stats['private_people_count']))
+            log.info("Total businesses count: {}".format(self.stats['businesses_count']))
+            log.info("Businesses without employees count: {}".format(self.stats['businesses_no_employees_count']))
             log.info("Total $ in the system: {}".format(self.stats['money_in_system_total']))
             log.info("Total # of bills: {}".format(self.stats['bills_count_total']))
             log.info("Mean bill size: {}".format(self.stats['bill_size_mean']))
@@ -514,8 +562,50 @@ class Simulator:
             log.info("Business receivers storage size: {} MB".format(self.stats['b_receivers_size_mb']))
             log.info("Personal receivers storage size: {} MB".format(self.stats['p_receivers_size_mb']))
 
-            plt.show()
+        """ Graphs """
+        # Wealth graph.
+        plt.hist([sum([self.bills_size[x] for x in self.wallets[i]]) / 100 for i in range(self.NODES)], bins=1000)
+        plt.xlim([0, self.NET_WORTH_AVG / 100 * 4])
+        plt.xlabel("$ per person")
+        plt.ylabel("# of ppl with this wealth")
 
+        if into_log:
+            plt.show()
+        if into_file:
+            plt.savefig(
+                os.path.join(self.output_path, "wealth_spread_overall_gen_{}.png".format(self.stats['generation'])),
+                bbox_inches='tight',
+            )
+        plt.clf()
+
+        # Businesses wealth graph.
+        plt.hist([sum([self.bills_size[x] for x in self.wallets[i]]) / 100 for i in self.businesses], bins=1000)
+        plt.xlim([0, self.NET_WORTH_AVG / 100 * 4])
+        plt.xlabel("$ per business")
+        plt.ylabel("# of businesses with this wealth")
+
+        if into_log:
+            plt.show()
+        if into_file:
+            plt.savefig(
+                os.path.join(self.output_path, "wealth_spread_businesses_gen_{}.png".format(self.stats['generation'])),
+                bbox_inches='tight',
+            )
+        plt.clf()
+
+        # Individuals' wealth graph.
+        plt.hist([sum([self.bills_size[x] for x in self.wallets[i]]) / 100 for i in self.non_businesses], bins=1000)
+        plt.xlim([0, self.NET_WORTH_AVG / 100 * 4])
+        plt.xlabel("$ per non-business person")
+        plt.ylabel("# of non-businesses with this wealth")
+
+        if into_log:
+            plt.show()
+        if into_file:
+            plt.savefig(
+                os.path.join(self.output_path, "wealth_spread_individuals_gen_{}.png".format(self.stats['generation'])),
+                bbox_inches='tight',
+            )
         plt.clf()
 
     def system_status_bills_title(self):
@@ -615,9 +705,9 @@ class Simulator:
 
     def generate_node_payees(self, node_id):
         """
-        Generate lists of close businesses and friends for the node_id node.
-        :param node_id: Which node to generate payees for.
-        :return: (list of business payees, list of private payees)
+        Generate lists of close businesses and friends for the node_id node
+        :param node_id: Which node to generate payees for
+        :return: (list of business payees, list of private payees, employer ID)
         """
 
         # Get node's quadrant.
@@ -626,6 +716,9 @@ class Simulator:
         # Create empty lists of receivers.
         self.p_receivers[node_id] = set()
         self.b_receivers[node_id] = set()
+
+        # Var to store the employer ID
+        employer_id = None
 
         # Pick number of friends and businesses.
         n_friends = self.get_asymmetric_norm(10, 60, 200)
@@ -699,6 +792,11 @@ class Simulator:
 
                 # Check if the node is a business or a consumer.
                 if k in self.businesses:
+                    # First and foremost we pick an employer.
+                    if not employer_id:
+                        employer_id = k
+                        continue
+
                     # If we still need close businesses.
                     if len(close_businesses) < n_close_businesses:
                         close_businesses.add(k)
@@ -718,7 +816,9 @@ class Simulator:
             close_businesses.union(far_businesses),
             # We mix close and far friends up because the payments send rate is uniform.
             # If it's not, you need to separate this and keep track of them separately.
-            close_friends.union(far_friends)
+            close_friends.union(far_friends),
+            # Node ID of the employer for this node.
+            employer_id,
         )
 
     def generate_node_payees_bulk(self, node_ids):
@@ -1033,14 +1133,6 @@ class Simulator:
 if __name__ == '__main__':
     simulator = Simulator(debug=False)
     simulator.output_system_status(into_log=False)
-
-    print("Wallets size: {} MB, Bills_size size: {} MB, Bills_cluster size: {} MB, Business receivers: {} MB, Private receivers: {} MB".format(
-        getsizeof(simulator.wallets)/1000000,
-        getsizeof(simulator.bills_size)/1000000,
-        getsizeof(simulator.bills_cluster)/1000000,
-        getsizeof(simulator.b_receivers)/1000000,
-        getsizeof(simulator.p_receivers)/1000000,
-    ))
     simulator.run()
-    simulator.output_system_status(into_log=False)
+    simulator.output_system_status(into_log=True)
 
