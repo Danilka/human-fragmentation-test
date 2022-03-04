@@ -24,7 +24,7 @@ class Simulator:
     OUTPUT_FOLDER = 'out'
 
     # Number of free cores on your CPU.
-    PROCESSES = 7
+    PROCESSES = 2
 
     # Default nu,ber of transactions to run.
     TRANSACTIONS = 10
@@ -42,8 +42,8 @@ class Simulator:
     # TRANSACTIONS_PER_PERSON_AVG = 1000  # Per year
     # TRANSACTIONS_PER_PERSON_MIN = 500   # Per year
     # TRANSACTIONS_PER_PERSON_MAX = 5000  # Per year
-    PAYROLL_FREQUENCY = 9   # Every Nth transaction payroll will be paid.
-    PAYROLL_VOLUME = 1.0     # Percentage of cash spent on payroll each pay period. [0, 1]
+    PAYROLL_FREQUENCY = 5   # Every Nth transaction payroll will be paid.
+    PAYROLL_VOLUME = 0.8     # Percentage of cash spent on payroll each pay period. [0, 1]
 
     TRANSACTION_SIZE_MIN = 0.001  # float % from net worth [0; 1]
     TRANSACTION_SIZE_MAX = 0.1  # float % from net worth [0; 1]
@@ -184,7 +184,15 @@ class Simulator:
             for i in range(self.NODES):
                 self.b_receivers[i] = payees[i][0]
                 self.p_receivers[i] = payees[i][1]
-                self.employees[payees[i][2]].add(payees[i][2])
+                self.employees[payees[i][2]].add(i)
+
+            # Add random employees to businesses with no employees.
+            random_private_users = list(copy.deepcopy(self.non_businesses))
+            random.shuffle(random_private_users)
+            for i in self.businesses:
+                if i not in self.employees.keys():
+                    self.employees[i].add(random_private_users.pop())
+            del random_private_users
 
         with Timer('Generate bills'):
             self.generate_bills()
@@ -233,9 +241,6 @@ class Simulator:
         global log
         transactions_map, wallets, bills_size, bills_cluster, free_bill_ids = args
 
-        if len(set(free_bill_ids)) != len(free_bill_ids):
-            raise Exception('Duplicate in free_bill_ids #1')
-
         # Vars to keep track of stats.
         bills_used_total = 0
         transaction_volume_total = 0
@@ -246,8 +251,9 @@ class Simulator:
                 amount = int(cls.get_balance_static(from_node_id, wallets, bills_size) * random.uniform(0.01, 1.0) ** 2)
             transaction_volume_total += amount
 
-            if len(set(free_bill_ids)) != len(free_bill_ids):
-                raise Exception('Duplicate in free_bill_ids #2')
+            # If the transaction size is 0, we skipp it.
+            if not amount:
+                continue
 
             # Perform the transaction.
             bills_used_total += cls.send_amount(
@@ -260,15 +266,8 @@ class Simulator:
                 free_bill_ids,
             )
 
-            if len(set(free_bill_ids)) != len(free_bill_ids):
-                raise Exception('Duplicate in free_bill_ids #3')
-
             # Merge bills.
             free_bill_ids += cls.merge_nodes_bills(to_node_id, wallets, bills_size, bills_cluster)
-
-            if len(set(free_bill_ids)) != len(free_bill_ids):
-                raise Exception('Duplicate in free_bill_ids #4')
-
 
         return wallets, bills_size, bills_cluster, free_bill_ids, bills_used_total, transaction_volume_total
 
@@ -291,6 +290,10 @@ class Simulator:
             from_nodes = [x for x in range(self.NODES)]
         random.shuffle(from_nodes)
 
+        ###
+        # all_ids = [set() for _ in range(self.PROCESSES)]
+
+
         if payroll:
             for from_node_id in from_nodes:
                 bucket = from_node_id % self.PROCESSES
@@ -307,9 +310,27 @@ class Simulator:
                         )
                     )
 
+                    ###
+                    # all_ids[bucket].add(from_node_id)
+                    # all_ids[bucket].add(to_node_id)
+
                     # Save the bucket mapping.
+                    nodes_buckets[bucket].add(to_node_id)
+                    ###
+                    if to_node_id in node_to_bucket.keys():
+                        if node_to_bucket[to_node_id] != bucket:
+                            raise Exception
                     node_to_bucket[to_node_id] = bucket
-                node_to_bucket[from_node_id] = bucket
+
+                    nodes_buckets[bucket].add(from_node_id)
+                    node_to_bucket[from_node_id] = bucket
+
+            ###
+            # print(len(all_ids[0]))
+            # num_in_0th = set([key for key, val in node_to_bucket.items() if val == 0])
+            # print(num_in_0th)
+            # iii = 0
+
         else:
             # Generate recipients.
             # from_node_id = random.randrange(self.NODES)
@@ -387,6 +408,24 @@ class Simulator:
             for bill_id in wallets_split[bucket_id][node_id]:
                 bills_size_split[bucket_id][bill_id] = self.bills_size[bill_id]
                 bills_cluster_split[bucket_id][bill_id] = self.bills_cluster[bill_id]
+
+
+
+
+
+        # TODO REMOVE
+        for p in range(self.PROCESSES):
+            if set.union(
+                    set([x for x, _, _ in transactions_buckets[p]]),
+                    set([x for _, x, _ in transactions_buckets[p]])
+            ) != set(wallets_split[p].keys()):
+                print("Process {} has fucked up wallets!".format(p))
+
+        _ = set.union(set([x for x,y,z in transactions_buckets[0]]),set([y for x,y,z in transactions_buckets[0]]))\
+            - set([key if val==0 else None for key, val in node_to_bucket.items()])
+
+
+
 
         # Run transactions in parallel.
         # Arguments prep.
@@ -713,6 +752,9 @@ class Simulator:
         # Get node's quadrant.
         node_quadrant_x, node_quadrant_y = self.nodes_to_quadrant[node_id]
 
+        # Set self business flag.
+        is_a_business = node_id in self.businesses
+
         # Create empty lists of receivers.
         self.p_receivers[node_id] = set()
         self.b_receivers[node_id] = set()
@@ -793,9 +835,11 @@ class Simulator:
                 # Check if the node is a business or a consumer.
                 if k in self.businesses:
                     # First and foremost we pick an employer.
-                    if not employer_id:
-                        employer_id = k
-                        continue
+                    # Except for when the node is a business itself.
+                    if not is_a_business:
+                        if not employer_id:
+                            employer_id = k
+                            continue
 
                     # If we still need close businesses.
                     if len(close_businesses) < n_close_businesses:
