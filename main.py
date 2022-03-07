@@ -24,17 +24,17 @@ class Simulator:
     OUTPUT_FOLDER = 'out'
 
     # Number of free cores on your CPU.
-    PROCESSES = 2
+    PROCESSES = 20
 
     # Default nu,ber of transactions to run.
-    TRANSACTIONS = 10
+    TRANSACTIONS = 1000
 
-    CLUSTERS = 16 * 16  # *256
+    CLUSTERS = 16 * 3906  # *256
     NODES_PER_CLUSTER = 16
     NODES = CLUSTERS * NODES_PER_CLUSTER
     BUSINESSES_PERCENT = 0.05  # float % from 0 to 1
 
-    TRANSACTIONS_P2P_PERCENT = 0.2  # float % from 0 to 1
+    TRANSACTIONS_P2P_PERCENT = 0.3  # float % from 0 to 1
 
     # Regulated by the total number of transaction runs at the moment.
     TRANSACTIONS_P2P_UNIQUE = 50  # Number of people that any person interacts with
@@ -42,11 +42,11 @@ class Simulator:
     # TRANSACTIONS_PER_PERSON_AVG = 1000  # Per year
     # TRANSACTIONS_PER_PERSON_MIN = 500   # Per year
     # TRANSACTIONS_PER_PERSON_MAX = 5000  # Per year
-    PAYROLL_FREQUENCY = 5   # Every Nth transaction payroll will be paid.
+    PAYROLL_FREQUENCY = 10   # Every Nth transaction payroll will be paid.
     PAYROLL_VOLUME = 0.8     # Percentage of cash spent on payroll each pay period. [0, 1]
 
-    TRANSACTION_SIZE_MIN = 0.001  # float % from net worth [0; 1]
-    TRANSACTION_SIZE_MAX = 0.1  # float % from net worth [0; 1]
+    TRANSACTION_SIZE_MIN = 0.0001  # float % from net worth [0; 1]
+    TRANSACTION_SIZE_MID = 0.01  # float % from net worth [0; 1]
 
     NET_WORTH_MIN = 10 * 100  # In cents
     NET_WORTH_AVG = 1000 * 100    # 1000 * 100  # In cents
@@ -245,10 +245,19 @@ class Simulator:
         bills_used_total = 0
         transaction_volume_total = 0
 
+        transaction_size_multipliers = [
+            x/1e8 for x in cls.get_lognorm(
+                cls.TRANSACTION_SIZE_MIN*1e8,
+                cls.TRANSACTION_SIZE_MID*1e8,
+                len(transactions_map)
+            )
+        ]
+
+        i = 0
         for from_node_id, to_node_id, amount in transactions_map:
             # Get balance.
             if not amount:
-                amount = int(cls.get_balance_static(from_node_id, wallets, bills_size) * random.uniform(0.01, 1.0) ** 2)
+                amount = int(cls.get_balance_static(from_node_id, wallets, bills_size) * transaction_size_multipliers.pop())
             transaction_volume_total += amount
 
             # If the transaction size is 0, we skipp it.
@@ -268,6 +277,8 @@ class Simulator:
 
             # Merge bills.
             free_bill_ids += cls.merge_nodes_bills(to_node_id, wallets, bills_size, bills_cluster)
+
+            i += 1
 
         return wallets, bills_size, bills_cluster, free_bill_ids, bills_used_total, transaction_volume_total
 
@@ -290,10 +301,6 @@ class Simulator:
             from_nodes = [x for x in range(self.NODES)]
         random.shuffle(from_nodes)
 
-        ###
-        # all_ids = [set() for _ in range(self.PROCESSES)]
-
-
         if payroll:
             for from_node_id in from_nodes:
                 bucket = from_node_id % self.PROCESSES
@@ -310,10 +317,6 @@ class Simulator:
                         )
                     )
 
-                    ###
-                    # all_ids[bucket].add(from_node_id)
-                    # all_ids[bucket].add(to_node_id)
-
                     # Save the bucket mapping.
                     nodes_buckets[bucket].add(to_node_id)
                     ###
@@ -324,13 +327,6 @@ class Simulator:
 
                     nodes_buckets[bucket].add(from_node_id)
                     node_to_bucket[from_node_id] = bucket
-
-            ###
-            # print(len(all_ids[0]))
-            # num_in_0th = set([key for key, val in node_to_bucket.items() if val == 0])
-            # print(num_in_0th)
-            # iii = 0
-
         else:
             # Generate recipients.
             # from_node_id = random.randrange(self.NODES)
@@ -408,24 +404,6 @@ class Simulator:
             for bill_id in wallets_split[bucket_id][node_id]:
                 bills_size_split[bucket_id][bill_id] = self.bills_size[bill_id]
                 bills_cluster_split[bucket_id][bill_id] = self.bills_cluster[bill_id]
-
-
-
-
-
-        # TODO REMOVE
-        for p in range(self.PROCESSES):
-            if set.union(
-                    set([x for x, _, _ in transactions_buckets[p]]),
-                    set([x for _, x, _ in transactions_buckets[p]])
-            ) != set(wallets_split[p].keys()):
-                print("Process {} has fucked up wallets!".format(p))
-
-        _ = set.union(set([x for x,y,z in transactions_buckets[0]]),set([y for x,y,z in transactions_buckets[0]]))\
-            - set([key if val==0 else None for key, val in node_to_bucket.items()])
-
-
-
 
         # Run transactions in parallel.
         # Arguments prep.
@@ -619,7 +597,7 @@ class Simulator:
 
         # Businesses wealth graph.
         plt.hist([sum([self.bills_size[x] for x in self.wallets[i]]) / 100 for i in self.businesses], bins=1000)
-        plt.xlim([0, self.NET_WORTH_AVG / 100 * 4])
+        plt.xlim([0, self.NET_WORTH_AVG / 10])
         plt.xlabel("$ per business")
         plt.ylabel("# of businesses with this wealth")
 
@@ -634,7 +612,7 @@ class Simulator:
 
         # Individuals' wealth graph.
         plt.hist([sum([self.bills_size[x] for x in self.wallets[i]]) / 100 for i in self.non_businesses], bins=1000)
-        plt.xlim([0, self.NET_WORTH_AVG / 100 * 4])
+        plt.xlim([0, self.NET_WORTH_AVG / 10])
         plt.xlabel("$ per non-business person")
         plt.ylabel("# of non-businesses with this wealth")
 
@@ -1178,5 +1156,5 @@ if __name__ == '__main__':
     simulator = Simulator(debug=False)
     simulator.output_system_status(into_log=False)
     simulator.run()
-    simulator.output_system_status(into_log=True)
+    simulator.output_system_status(into_log=False)
 

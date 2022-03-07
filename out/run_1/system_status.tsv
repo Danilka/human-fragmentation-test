@@ -1,0 +1,40 @@
+---SYSTEM STATUS on Gen. 0---
+Total nodes:	8192
+Total private people count:	7698
+Total businesses count:	494
+Businesses without employees count:	0
+Total $ in the system:	7943163.36
+Total # of bills:	407208
+Mean bill size:	19.506403017622446
+Avg # of bills per person:	49.7080078125
+Mean wealth per person:	969.62443359375
+Max wealth per person:	16923.88
+Min wealth per person:	26.97
+Mean friends per person:	83.61572265625
+Mean businesses per person:	71.4923095703125
+Wallets storage size (MB):	0.295016
+Bills storage size (MB):	20.971624
+Bills cluster storage size (MB):	20.971624
+Business receivers storage size (MB):	0.295016
+Personal receivers storage size (MB):	0.295016
+
+---SYSTEM STATUS on Gen. 9---
+Total nodes:	8192
+Total private people count:	7698
+Total businesses count:	494
+Businesses without employees count:	0
+Total $ in the system:	7943163.36
+Total # of bills:	228465
+Mean bill size:	34.76752833037883
+Avg # of bills per person:	27.8887939453125
+Mean wealth per person:	969.62443359375
+Max wealth per person:	15942.13
+Min wealth per person:	26.42
+Mean friends per person:	83.61572265625
+Mean businesses per person:	71.4923095703125
+Wallets storage size (MB):	0.295016
+Bills storage size (MB):	10.485872
+Bills cluster storage size (MB):	10.485872
+Business receivers storage size (MB):	0.295016
+Personal receivers storage size (MB):	0.295016
+
